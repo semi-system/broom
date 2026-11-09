@@ -18,6 +18,11 @@ efibootmgr, util-linux, dosfstools and others, under their own licenses (mostly 
 corresponding source is in the Ubuntu archive (`apt-get source <package>=<version>`, or
 https://launchpad.net/ubuntu/+source/<package>/<version>). These are not covered by the Apache License above.
 
+mgmt/ipxe/wimboot is the unmodified official wimboot v2.9.0 release binary (https://github.com/ipxe/wimboot, signed by
+Microsoft; mgmt/ipxe/fetch-signed.sh fetches it and checks its SHA-256), licensed under the GNU General Public License;
+its source is that release tag. The binary serves it to PCs for "Add hardware" (Windows PE). It is not covered by
+the Apache License above.
+
 mgmt/static/novnc/ holds noVNC 1.7.0 (https://github.com/novnc/noVNC, tag v1.7.0; npm @novnc/novnc 1.7.0), unmodified:
 its core library under the Mozilla Public License 2.0 and its bundled pako under the MIT license — see
 mgmt/static/novnc/README.broom.md, LICENSE.txt, LICENSE.MPL-2.0 and vendor/pako/LICENSE. The binary serves these files

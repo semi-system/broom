@@ -187,11 +187,7 @@ fn subnets() {
     let ip = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
     let m24 = ip("255.255.255.0");
     assert!(same_subnet(ip("192.168.1.111"), m24, ip("192.168.1.121")));
-    assert!(!same_subnet(
-        ip("192.168.1.111"),
-        m24,
-        ip("192.168.89.121")
-    ));
+    assert!(!same_subnet(ip("192.168.1.111"), m24, ip("192.168.2.121")));
     assert!(!same_subnet(ip("192.168.1.111"), m24, ip("10.20.0.21")));
     assert!(same_subnet(
         ip("10.0.0.1"),
