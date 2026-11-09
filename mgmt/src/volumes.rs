@@ -160,6 +160,15 @@ fn find(st: &SharedState, id: &str) -> Result<Volume, String> {
         .ok_or_else(|| format!("no disk {id}"))
 }
 
+/// Folder `sub` on volume `id` (diskless.rs: goldens, the machines' layers, the ISO library), which must be mounted.
+pub(crate) fn folder_on(st: &SharedState, id: &str, sub: &str) -> Result<PathBuf, String> {
+    let v = find(st, id)?;
+    if !mounted_or_folder(&v) {
+        return Err(format!("disk {} is not mounted", v.id));
+    }
+    Ok(v.path.join(sub))
+}
+
 // ---------- mounts ----------
 
 /// Mount points by device number (major:minor) from /proc/self/mountinfo, with the filesystem type.

@@ -23,6 +23,20 @@
     </div>
   </div>
   <div class="card card-body mb-3" data-owner>
+    <h2 class="h6 text-uppercase text-body-secondary mb-3">HTTPS (web admin)</h2>
+    <p class="small text-body-secondary mb-2">The web admin is served on <b>https://</b>; plain http:// sends a browser there. The machines (boot, Remote agents, their scripts) keep plain HTTP. With Broom's own <b>self-signed</b> certificate a browser warns the first time: check that the fingerprint it shows is the one below, or install the certificate on the staff PCs (Download) so it stops warning. Or use <b>your own</b> certificate (from your CA or a public one, for the name you open this page with).</p>
+    <div id="tls_info" class="small mb-2"></div>
+    <div class="form-check form-switch mb-3"><input class="form-check-input" type="checkbox" id="tls_on" data-change="tlsOn"><label class="form-check-label small" for="tls_on">Web admin on HTTPS only (off: plain http:// serves it too)</label></div>
+    <div class="d-flex flex-wrap gap-2 align-items-end mb-2">
+      <div><label class="form-label small mb-1" for="tls_cert">Certificate (PEM, with its chain)</label><input class="form-control form-control-sm" type="file" id="tls_cert" accept=".pem,.crt,.cer"></div>
+      <div><label class="form-label small mb-1" for="tls_key">Its private key (PEM)</label><input class="form-control form-control-sm" type="file" id="tls_key" accept=".pem,.key"></div>
+      <button class="btn btn-sm btn-primary" data-click="tlsUpload">Use these</button>
+      <button class="btn btn-sm btn-outline-secondary" data-click="tlsSelfSigned">New self-signed certificate</button>
+      <a class="btn btn-sm btn-outline-secondary" href="/api/config/tls/cert.pem">Download certificate</a>
+      <span id="tls_msg" class="msg align-self-center"></span>
+    </div>
+  </div>
+  <div class="card card-body mb-3" data-owner>
     <h2 class="h6 text-uppercase text-body-secondary mb-3">Countdown boot menu</h2>
     <div class="d-flex flex-wrap gap-2 align-items-center"><input class="form-control form-control-sm" id="timeout" type="number" min="0" max="3600" style="width:90px"> seconds
       <button class="btn btn-sm btn-outline-primary" data-click="setTimeout_">Save</button> <span id="to_msg" class="msg"></span></div>

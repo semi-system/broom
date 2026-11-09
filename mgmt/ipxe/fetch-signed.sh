@@ -5,10 +5,14 @@
 #                      it loads snponly.efi from the same TFTP directory by name
 #   snponly.efi      = iPXE snponly signed by the iPXE Secure Boot CA
 # Our own ipxe-src build can't be signed (Secure Boot exists to stop that), hence the official binaries.
+#   ../wimboot       = wimboot (signed by Microsoft UEFI CA 2011): boots Windows PE over HTTP for "Add hardware"
+#                      (onboard.rs), with our own iPXE and under Secure Boot alike
 # Pinned release + sha256: rerun with another VERSION/SHA256 to upgrade. UBDL allows redistributing them unmodified.
 set -euo pipefail
 VERSION=v2.0.0
 SHA256=01a526d4cc791fc30362259c609d6c506cc64a7bdff51b9a5eb788354e17eee1
+WIMBOOT_VERSION=v2.9.0
+WIMBOOT_SHA256=5f067ccdc4d084d5bf77b6c853bd0f8402dfc2b4cd1b103d358993ae97fae8e3
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 curl -fsSL -o "$tmp/ipxeboot.tar.gz" "https://github.com/ipxe/ipxe/releases/download/$VERSION/ipxeboot.tar.gz"
@@ -19,3 +23,7 @@ cp "$tmp/ipxeboot/x86_64-sb/shimx64.efi" "$here/signed/snponly-shim.efi"
 cp "$tmp/ipxeboot/x86_64-sb/snponly.efi" "$here/signed/snponly.efi"
 ( cd "$here/signed" && { echo "iPXE $VERSION ipxeboot.tar.gz x86_64-sb (sha256 $SHA256)"; sha256sum snponly-shim.efi snponly.efi; } > VERSION )
 cat "$here/signed/VERSION"
+curl -fsSL -o "$tmp/wimboot" "https://github.com/ipxe/wimboot/releases/download/$WIMBOOT_VERSION/wimboot"
+echo "$WIMBOOT_SHA256  $tmp/wimboot" | sha256sum -c -
+cp "$tmp/wimboot" "$here/wimboot"
+echo "wimboot $WIMBOOT_VERSION ($WIMBOOT_SHA256)"

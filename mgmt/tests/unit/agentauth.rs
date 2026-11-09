@@ -1,5 +1,18 @@
 use super::*;
 
+/// A diskless base records the key's fingerprint, never the key: stable, short, different per key, "" for no key.
+#[test]
+fn key_fingerprint() {
+    let k = "ab".repeat(32);
+    let f = fingerprint_of(&k);
+    assert_eq!(f.len(), 16);
+    assert_eq!(f, fingerprint_of(&k));
+    assert!(!k.contains(&f), "not a piece of the key itself");
+    assert_ne!(f, fingerprint_of(&"cd".repeat(32)));
+    assert_eq!(fingerprint_of(""), "");
+    assert_eq!(fingerprint_of("not hex"), "");
+}
+
 /// RFC 4231 test cases 1, 2 and 6 (key longer than the block).
 #[test]
 fn hmac_sha256_vectors() {

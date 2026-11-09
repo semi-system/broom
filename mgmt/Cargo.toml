@@ -27,6 +27,9 @@ ext4-view = "1.0.0"   # read ext4 inside Linux goldens (replaces libguestfs)
 zip = { version = "9.0.4", default-features = false, features = ["deflate"] }   # golden .zip upload (replaces unzip)
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }   # gzip for initrd cpio + tar.gz (archive.rs)
 crc32fast = "1.5.2"   # GPT checksums (disk.rs)
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }   # HTTPS for the admin pages (tls.rs)
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }   # its self-signed certificate
+time = { version = "0.3.55", default-features = false }   # that certificate's dates (rcgen takes time::OffsetDateTime)
 ureq = "3"   # HTTPS download of the Windows stage bundle (rustls + built-in CA roots, static-friendly)
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }   # password verifiers of the sign-in handshake (pwproof.rs)
 # Read the Windows golden's NTFS in process (ntfsread.rs; no loop + ntfs3 on the server). Pinned to upstream master:

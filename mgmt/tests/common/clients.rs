@@ -34,16 +34,64 @@ impl Resp {
 }
 
 /// One request per connection (Connection: close), session cookie kept by hand.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Http {
     pub cookie: Option<String>,
     /// The session key of the sign-in handshake (new passwords are sealed with it).
     pub sk: Option<[u8; 32]>,
+    /// HTTPS (port 443) trusting exactly these certificates, as a pinned client does.
+    pub tls: Option<std::sync::Arc<tokio_rustls::rustls::ClientConfig>>,
 }
 
 impl Http {
     pub fn new() -> Http {
         Http::default()
+    }
+
+    /// An HTTPS client that trusts only `cert_pem` (the server's self-signed certificate, or one uploaded).
+    pub fn tls(cert_pem: &str) -> Http {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        use tokio_rustls::rustls;
+        let mut roots = rustls::RootCertStore::empty();
+        for c in CertificateDer::pem_slice_iter(cert_pem.as_bytes()) {
+            roots.add(c.expect("certificate PEM")).unwrap();
+        }
+        let cfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Http {
+            tls: Some(std::sync::Arc::new(cfg)),
+            ..Http::default()
+        }
+    }
+
+    /// The same kind of client (HTTP or HTTPS with the same trust), signed out.
+    pub fn fresh(&self) -> Http {
+        Http {
+            tls: self.tls.clone(),
+            ..Http::default()
+        }
+    }
+
+    /// The HTTPS handshake alone (Err = refused, e.g. a certificate this client does not trust).
+    pub fn handshake(&self) -> Result<(), String> {
+        use tokio_rustls::rustls;
+        // A full handshake: no resumed session (which skips the certificate) from earlier requests.
+        let mut cfg = (*self.tls.clone().expect("an HTTPS client")).clone();
+        cfg.resumption = rustls::client::Resumption::disabled();
+        let cfg = std::sync::Arc::new(cfg);
+        let tcp = TcpStream::connect((SRV, 443)).map_err(|e| e.to_string())?;
+        let name = rustls::pki_types::ServerName::try_from(SRV.to_string()).unwrap();
+        let mut c = rustls::ClientConnection::new(cfg, name).unwrap();
+        let mut t = tcp;
+        while c.is_handshaking() {
+            c.complete_io(&mut t).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn get(&self, path: &str) -> Resp {
@@ -75,9 +123,19 @@ impl Http {
     }
 
     pub fn request(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Resp {
-        let mut s =
-            TcpStream::connect((SRV, 80)).unwrap_or_else(|e| panic!("connect {SRV}:80: {e}"));
-        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let port = if self.tls.is_some() { 443 } else { 80 };
+        let tcp =
+            TcpStream::connect((SRV, port)).unwrap_or_else(|e| panic!("connect {SRV}:{port}: {e}"));
+        tcp.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut s: Box<dyn ReadWrite> = match &self.tls {
+            None => Box::new(tcp),
+            Some(cfg) => {
+                let name =
+                    tokio_rustls::rustls::pki_types::ServerName::try_from(SRV.to_string()).unwrap();
+                let c = tokio_rustls::rustls::ClientConnection::new(cfg.clone(), name).unwrap();
+                Box::new(tokio_rustls::rustls::StreamOwned::new(c, tcp))
+            }
+        };
         let mut req = format!(
             "{method} {path} HTTP/1.1\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
@@ -95,10 +153,18 @@ impl Http {
         s.write_all(req.as_bytes()).unwrap();
         s.write_all(body).unwrap();
         let mut raw = Vec::new();
-        s.read_to_end(&mut raw).unwrap();
+        match s.read_to_end(&mut raw) {
+            Ok(_) => {}
+            // TLS: a peer that closes without close_notify (the whole answer is in already).
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
+            Err(e) => panic!("{method} {path}: {e}"),
+        }
         parse_response(&raw)
     }
 }
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
 
 fn parse_response(raw: &[u8]) -> Resp {
     let end = raw

@@ -1,15 +1,24 @@
 # Games disks (Images page) as drive letters: the server says which ones this machine gets (its group), one line each
-# "<name> <iqn> <letter> <1 = this machine is that disk's update machine>". Each comes over iSCSI READ-ONLY and holds
+# "<name> <iqn> <letter> <mode>": mode 1 = this machine is that disk's update machine, 0 = a machine with an SSD,
+# 2 = a diskless machine: the iqn is its own copy of the disk on the server (writable, its writes dropped at its next
+# PXE boot), whose games.vhdx it attaches directly (no SSD for a differencing disk). Diskless machines run this from
+# broom-watch.ps1 -Dir. Each comes over iSCSI READ-ONLY and holds
 # games.vhdx; this machine opens it through a differencing VHDX on its SSD (BROOMWIN broom\games-<name>-child.vhdx,
 # deleted by the stage every boot), so a guest's writes stay on this machine until the next boot and the games disk
 # never changes. A disk's update machine gets it writable and attaches games.vhdx itself: the server keeps those
 # writes apart until the admin saves them. Run by broom-bootorder.ps1 (SYSTEM, at startup + every 5 minutes): does
 # what is missing, nothing once every drive is there. Errors -> %SystemRoot%\Temp\broom-games.log. ASCII only.
-param([string]$Srv)
+# -LinesFile: the lines come from that file instead (the maintenance VM on the server, broom-diskless.ps1): there the
+# disks are local disks of the VM, named "serial:<disk serial>", always in update mode.
+# Why mode 2 (diskless): such a machine has no SSD to hold a differencing VHDX, so its writes (game settings, saves,
+# shader caches) go to its own layer on the server instead, and that layer is dropped at its next PXE boot - the same
+# clean-every-boot rule as the SSD machines, one sparse copy per machine rather than a full copy of the disk.
+param([string]$Srv, [string]$LinesFile)
 $ErrorActionPreference = 'Stop'
 # The run at startup comes before the network is up (DHCP): wait for the server up to ~90 s instead of giving up
 # until the next run 5 minutes later.
 $list = $null
+if ($LinesFile) { $list = [IO.File]::ReadAllText($LinesFile) }
 $until = (Get-Date).AddSeconds(90)
 while ($null -eq $list -and (Get-Date) -lt $until) {
   try { $list = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri "http://$Srv/api/games/for").Content } catch { Start-Sleep 3 }
@@ -60,26 +69,40 @@ function SetLetter($vd, $L) {
   if ($q.DriveLetter -ne [char]$L) { Set-Partition -DiskNumber $vd.Number -PartitionNumber $q.PartitionNumber -NewDriveLetter $L }
 }
 
-function GamesDisk($name, $iqn, $L, $upd) {
-  $store = "$env:ProgramData\broom\games\$name"
+function GamesDisk($name, $iqn, $L, $mode) {
+  $upd = $mode -eq '1'; $own = $mode -eq '2'
+  # The maintenance VM: a local disk found by its serial, update mode only. Its folder is outside ProgramData\broom
+  # and is let go again once games.vhdx is attached (below): no mount point is ever saved into the golden.
+  $local = $iqn -like 'serial:*'
+  if ($local -and -not $upd) { throw 'a VM disk is always in update mode' }
+  $store = if ($local) { "$env:SystemRoot\Temp\broom-vm-games\$name" } else { "$env:ProgramData\broom\games\$name" }
   $vhd = "$store\games.vhdx"
   $ssd = "$env:ProgramData\broom\ssd"
   $child = "$ssd\broom\games-$name-child.vhdx"
-  if (Ready ($(if ($upd) { $vhd } else { $child })) $L) { return }
+  if (Ready ($(if ($upd -or $own) { $vhd } else { $child })) $L) { return }
 
+  $disk = $null
+  if ($local) {
+    # 1'. The VM's disk with that serial.
+    $serial = $iqn.Substring(7)
+    for ($i = 0; $i -lt 30 -and -not $disk; $i++) {
+      $disk = Get-Disk | Where-Object { $_.SerialNumber -and $_.SerialNumber.Trim() -eq $serial } | Select-Object -First 1
+      if (-not $disk) { Start-Sleep 1 }
+    }
+  } else {
   # 1. Its iSCSI session (not persistent: made again every boot).
   if (-not (Get-IscsiTargetPortal | Where-Object TargetPortalAddress -eq $Srv)) { New-IscsiTargetPortal -TargetPortalAddress $Srv | Out-Null }
   $sess = Get-IscsiSession | Where-Object { $_.TargetNodeAddress -eq $iqn -and $_.IsConnected }
   if (-not $sess) { $null = Connect-IscsiTarget -NodeAddress $iqn -TargetPortalAddress $Srv }
-  $disk = $null
   for ($i = 0; $i -lt 30 -and -not $disk; $i++) {
     $sess = Get-IscsiSession | Where-Object { $_.TargetNodeAddress -eq $iqn -and $_.IsConnected }
     if ($sess) { $disk = Get-Disk -iSCSISession $sess -ErrorAction SilentlyContinue }
     if (-not $disk) { Start-Sleep 1 }
   }
+  }
   if (-not $disk) { throw 'the disk did not show up' }
   if ($disk.IsOffline) { Set-Disk -Number $disk.Number -IsOffline $false }   # SAN policy: new shared disks offline
-  if ($upd -and $disk.IsReadOnly) { Set-Disk -Number $disk.Number -IsReadOnly $false }
+  if (($upd -or $own) -and $disk.IsReadOnly) { Set-Disk -Number $disk.Number -IsReadOnly $false }
   $disk = Get-Disk -Number $disk.Number
 
   if ($upd) {
@@ -101,7 +124,24 @@ function GamesDisk($name, $iqn, $L, $upd) {
     if ($vd.PartitionStyle -eq 'RAW') { NewNtfs $vd.Number $name.ToUpper() }
     $null = Grow (BasicPart $vd.Number)
     SetLetter $vd $L
+    if ($local) {
+      # games.vhdx stays attached (its file is open); the folder it was reached through goes, so the golden saved
+      # from this VM never holds a mount point.
+      Remove-PartitionAccessPath -DiskNumber $p.DiskNumber -PartitionNumber $p.PartitionNumber -AccessPath "$store\"
+      Remove-Item -LiteralPath $store -Force -ErrorAction SilentlyContinue
+    }
     Log "$name - UPDATE mode: writable as ${L}: - shut down properly when done, then Save on the server"
+  } elseif ($own) {
+    # 2c. A diskless machine: its own copy of the disk (the server keeps its writes until its next PXE boot), so
+    # games.vhdx is attached as it is, writable - never formatted or grown here (that is the update machine's job).
+    $p = BasicPart $disk.Number
+    if (-not $p) { throw 'the disk is empty: set it up from its update machine first' }
+    MountAt $p $store
+    Hide $p $false
+    if (-not (Test-Path $vhd)) { throw 'no games.vhdx on the disk yet: set it up from its update machine first' }
+    if (-not (Get-DiskImage -ImagePath $vhd).Attached) { DP "select vdisk file=`"$vhd`"", 'attach vdisk' }
+    SetLetter (Get-DiskImage -ImagePath $vhd | Get-Disk) $L
+    Log "$name - diskless: its own copy as ${L}: (writes dropped at the next PXE boot)"
   } else {
     # 2b. Every other machine: games.vhdx read-only under this boot's differencing disk on the SSD (BROOMWIN: C: is
     # a VHDX itself, another VHDX cannot live in it).
@@ -125,7 +165,7 @@ function GamesDisk($name, $iqn, $L, $upd) {
 function Up($name, $L) {
   try { $d = New-Object IO.DriveInfo "${L}:"; $d.IsReady -and $d.VolumeLabel -eq $name.ToUpper() } catch { $false }
 }
-$re = '^([a-z0-9-]+) (\S+) ([D-Z]) ([01])\s*$'
+$re = '^([a-z0-9-]+) (\S+) ([D-Z]) ([012])\s*$'
 # Every disk already up (the 5-minute runs, nearly always) -> nothing to do.
 $lines = @($list -split "`n" | Where-Object { $_ -match $re -and -not (Up $Matches[1] $Matches[3]) })
 if ($lines.Count -eq 0) { exit }
@@ -137,5 +177,5 @@ try {
 foreach ($l in $lines) {
   $null = $l -match $re
   $name = $Matches[1]
-  try { GamesDisk $name $Matches[2] $Matches[3] ($Matches[4] -eq '1') } catch { Log "$name - $($_.Exception.Message)" }
+  try { GamesDisk $name $Matches[2] $Matches[3] $Matches[4] } catch { Log "$name - $($_.Exception.Message)" }
 }

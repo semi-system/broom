@@ -284,3 +284,187 @@ fn api_contract() {
         );
     });
 }
+
+/// HTTPS for the web admin (tls.rs): a self-signed certificate made at first start; on plain HTTP the admin pages are
+/// sent to https://, the admin API refused, the machines' paths served; the session cookie is Secure; an uploaded
+/// certificate takes over at once (no restart), a bad one is refused; a new self-signed one on request; HTTPS can be
+/// turned off for the admin pages.
+#[test]
+fn https_admin() {
+    sandbox("https_admin", || {
+        let home = Home::new("https");
+        let _srv = Server::start_with(&home, &["--https-port", "443"]);
+        let anon = Http::new();
+
+        // What the capture tool reads first (public, plain HTTP): the port and the certificate to trust.
+        let t = anon.get("/api/tls/cert").json();
+        assert_eq!(
+            (t["port"].as_u64(), t["self_signed"].as_bool()),
+            (Some(443), Some(true))
+        );
+        let cert = t["cert"].as_str().unwrap().to_string();
+        assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"), "{t}");
+
+        // Plain HTTP: pages → https://, the sign-in API refused, the machines' paths served.
+        let nav = anon.request("GET", "/machines?x=1", &[("Accept", "text/html")], b"");
+        assert_eq!(
+            (nav.status, nav.header("location")),
+            (308, Some(format!("https://{SRV}/machines?x=1").as_str()))
+        );
+        assert_eq!(
+            anon.get("/login").header("location"),
+            Some(format!("https://{SRV}/login").as_str())
+        );
+        let hello = json!({"user": "admin", "cnonce": "00112233445566778899aabbccddeeff"});
+        assert_eq!(anon.post("/api/auth/hello", &hello).status, 403);
+        assert_eq!(anon.get("/boot.ipxe").status, 200);
+        assert_eq!(anon.get("/broom-diskless.ps1").status, 200);
+
+        // HTTPS, trusting exactly that certificate (by the server's IP): sign in there; the cookie is Secure.
+        let tls = Http::tls(&cert);
+        let h = admin_via(&home, &tls);
+        assert_eq!(h.get("/api/auth/status").json()["authed"], true);
+        let r = tls.post("/api/auth/hello", &hello);
+        assert_eq!(r.status, 200, "{}", r.text());
+        let r = h.get("/login");
+        assert!(
+            r.header("content-security-policy").is_some(),
+            "security headers on HTTPS too"
+        );
+
+        // That session on plain HTTP: not served (a browser would not even send it: Secure).
+        let leaked = Http {
+            cookie: h.cookie.clone(),
+            ..Http::new()
+        };
+        assert_eq!(leaked.get("/api/status").status, 308);
+        assert_eq!(
+            leaked
+                .post("/api/power", &json!({"action": "restart", "ids": []}))
+                .status,
+            403
+        );
+        // …except for the capture tool when it says it cannot check the certificate.
+        let tool = leaked.request("GET", "/api/status", &[("X-Broom-Tool", "capture")], b"");
+        assert_eq!(tool.status, 200);
+
+        // The System page's view: a self-signed certificate, its fingerprint, its end (≤ 825 days away).
+        let c = h.get("/api/config/tls").json();
+        assert_eq!(
+            (
+                c["kind"].as_str(),
+                c["https"].as_bool(),
+                c["listening"].as_bool()
+            ),
+            (Some("self-signed"), Some(true), Some(true))
+        );
+        let fp = |pem: &str| {
+            use sha2::Digest;
+            use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+            let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+            sha2::Sha256::digest(der.as_ref())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(c["sha256"].as_str(), Some(fp(&cert).as_str()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let until = c["until"].as_u64().unwrap();
+        assert!(
+            until > now + 800 * 86400 && until <= now + 825 * 86400,
+            "{c}"
+        );
+        assert!(
+            c["names"].as_array().unwrap().iter().any(|n| n == SRV),
+            "made for the server's address: {c}"
+        );
+
+        // Your own certificate (made here for the server's address): in use at once, the old one no longer served.
+        let mut p = rcgen::CertificateParams::new(vec![SRV.to_string()]).unwrap();
+        p.distinguished_name
+            .push(rcgen::DnType::CommonName, "venue test");
+        let k = rcgen::KeyPair::generate().unwrap();
+        let mine = p.self_signed(&k).unwrap();
+        let (mine_pem, mine_key) = (mine.pem(), k.serialize_pem());
+        let other_key = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        let r = h.post(
+            "/api/config/tls",
+            &json!({"cert": mine_pem, "key": other_key}),
+        );
+        assert_eq!(r.status, 400, "a key of another certificate: {}", r.text());
+        assert_eq!(
+            h.post("/api/config/tls", &json!({"cert": mine_pem})).status,
+            400,
+            "the key too"
+        );
+        let r = h.post(
+            "/api/config/tls",
+            &json!({"cert": mine_pem, "key": mine_key}),
+        );
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.json()["kind"], "uploaded");
+        assert_eq!(r.json()["sha256"].as_str(), Some(fp(&mine_pem).as_str()));
+        let h2 = Http {
+            cookie: h.cookie.clone(),
+            ..Http::tls(&mine_pem)
+        };
+        assert_eq!(
+            h2.get("/api/status").status,
+            200,
+            "the new one serves, same session"
+        );
+        let old = tls.handshake();
+        assert!(old.is_err(), "the old certificate is gone: {old:?}");
+        let t = anon.get("/api/tls/cert").json();
+        assert_eq!(
+            (t["self_signed"].as_bool(), t["cert"].as_str()),
+            (Some(false), Some("")),
+            "nothing to pin"
+        );
+        assert!(std::fs::read_to_string(home.0.join("tls/cert.pem")).unwrap() == mine_pem);
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(home.0.join("tls/key.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode, 0o600, "the key: root only");
+
+        // A new self-signed certificate on request: a new fingerprint, pinned again by the tool.
+        let r = h2.post("/api/config/tls", &json!({"self_signed": true}));
+        assert_eq!(r.status, 200, "{}", r.text());
+        let t = anon.get("/api/tls/cert").json();
+        let again = t["cert"].as_str().unwrap().to_string();
+        assert_ne!(fp(&again), fp(&cert));
+        let h3 = Http {
+            cookie: h.cookie.clone(),
+            ..Http::tls(&again)
+        };
+        assert_eq!(h3.get("/api/status").status, 200);
+
+        // HTTPS off for the admin pages: plain HTTP serves them again (the tool is told port 0); back on.
+        assert_eq!(
+            h3.post("/api/config/tls", &json!({"https": false})).status,
+            200
+        );
+        assert_eq!(leaked.get("/api/status").status, 200);
+        assert_eq!(anon.get("/api/tls/cert").json()["port"], 0);
+        assert_eq!(
+            leaked
+                .post("/api/config/tls", &json!({"https": true}))
+                .status,
+            200
+        );
+        assert_eq!(leaked.get("/api/status").status, 308);
+
+        // Signing out over HTTPS clears a Secure cookie.
+        let out = h3.post("/api/auth/logout", &json!({}));
+        let sc = out.header("set-cookie").unwrap_or("");
+        assert!(sc.contains("; Secure") && sc.contains("HttpOnly"), "{sc}");
+    });
+}

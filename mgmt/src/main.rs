@@ -14,7 +14,9 @@ mod dedup;
 mod devices;
 mod dhcp;
 mod disk;
+mod diskless;
 mod disks;
+mod display;
 mod dns;
 mod dnsrec;
 mod drivers;
@@ -28,8 +30,10 @@ mod goldenram;
 mod groups;
 mod hash;
 mod images;
+mod inventory;
 mod iscsi;
 mod iscsid;
+mod iso9660;
 mod license;
 mod linuxfs;
 mod logbuf;
@@ -37,7 +41,10 @@ mod machines;
 mod metrics;
 mod monitor;
 mod ntfsread;
+mod onboard;
 mod overlay;
+mod pins;
+mod power;
 mod preflight;
 mod publish;
 mod pwproof;
@@ -45,10 +52,12 @@ mod settings;
 mod setup;
 mod sysmon;
 mod tftp;
+mod tls;
 mod users;
 mod versions;
 mod vhdx;
 mod vmdk;
+mod vmmaint;
 mod vnc;
 mod volumes;
 mod winstage;
@@ -273,7 +282,7 @@ async fn events(
 }
 
 /// The web admin's pages (one URL each, + their fragment /ui/<page>).
-const PAGES: [&str; 13] = [
+const PAGES: [&str; 14] = [
     "machines",
     "images",
     "network",
@@ -285,6 +294,7 @@ const PAGES: [&str; 13] = [
     "remote",
     "server",
     "games",
+    "diskless",
     "windows",
     "logs",
 ];
@@ -495,6 +505,8 @@ async fn main() {
         }
         // The iSCSI daemon (its own process: survives this one's restarts) checked / started, missing targets restored
         // (background: a RAM copy is slow).
+        // A maintenance VM left running by the previous process keeps its disks writable (before the first sync).
+        vmmaint::restore(&state);
         let st = state.clone();
         tokio::task::spawn_blocking(move || publish::start_iscsi(&st));
         // Windows goldens: made again from image.img (same bytes as before the restart) + their RAM copies when set to
@@ -528,6 +540,7 @@ async fn main() {
                 let _ = tokio::task::spawn_blocking(move || {
                     iscsi::upgrade_if_idle();
                     let _ = games::sync(&st); // logs its own errors
+                    let _ = diskless::sync(&st); // idem (a maintenance machine's lease may move)
                     for img in st
                         .db
                         .images()
@@ -571,17 +584,26 @@ async fn main() {
         .route("/boot.ipxe", get(boot::render)) // iPXE menu
         .route("/boot/start", get(boot::start)) // menu choice → "client started" log + image boot script
         .route("/boot/capture", get(boot::capture)) // menu [C]: the stage in capture mode
+        .route("/boot/diskless", get(boot::diskless)) // a diskless golden: the machine's own iSCSI disk
+        .route("/boot/maint", get(boot::maint)) // a golden's maintenance machine: install from ISO / boot writable
         .route("/api/boot/local", axum::routing::post(boot::local)) // legacy BIOS: next boot → local disk, once
         .route("/broom-capture", get(capture_bin)) // this binary, for that stage
         .merge(images::routes()) // images, versions, upload, publish
         .merge(drivers::routes()) // Windows driver packages
         .merge(games::routes()) // games disks (Windows)
+        .merge(diskless::routes()) // diskless goldens, their machines, the ISO library
+        .merge(onboard::routes()) // Add hardware: a new PC's network card installed into a Windows golden
         .merge(groups::routes()) // Groups page
         .merge(machines::routes()) // Machines table
         .merge(license::routes()) // Windows license keys + boot reports
         .merge(settings::routes()) // boot menu, zram, DHCP, guest user
         .merge(devices::routes()) // Devices page: edit / bulk / CSV / detail
         .merge(monitor::routes()) // online status, Wake-on-LAN
+        .merge(power::routes()) // turn on / restart / shut down machines (Machines page)
+        .merge(inventory::routes()) // each machine's hardware list (Machines page)
+        .merge(display::routes()) // resolution + refresh per machine / group (Machines page)
+        .merge(pins::routes()) // versions kept + which one each group gets (Diskless / iSCSI Disks / Groups)
+        .merge(vmmaint::routes()) // Maintain in the browser: a golden + games disks in a VM, its screen here
         .merge(bench::routes()) // Benchmark page + client measurements
         .merge(vnc::routes()) // Remote page: screen + mouse/keys of a Windows machine
         .merge(agentauth::routes()) // Remote: agent keys (handed to the stage, re-issued)
@@ -591,6 +613,7 @@ async fn main() {
         .merge(dns::routes()) // DNS server for healthy machines (Network page)
         .merge(volumes::routes()) // server disks: format, mount, images / games disks on them
         .merge(auth::routes()) // admin login
+        .merge(tls::routes()) // HTTPS certificate (System page)
         .merge(users::routes()) // accounts (owners)
         // Serve boot assets over HTTP (kernel/initrd much faster than TFTP).
         // /tftp/... -> <home>/tftp/... (e.g. http://SERVER/tftp/broom-stage/vmlinuz); a Windows golden set to RAM
@@ -608,7 +631,47 @@ async fn main() {
             auth::guard,
         ))
         .layer(axum::middleware::from_fn(auth::security_headers)) // outermost: also on the guard's redirects / 401s
-        .with_state(state);
+        .with_state(state.clone());
+
+    // HTTPS for the web admin (tls.rs); the machines keep plain HTTP. No HTTPS port (taken, no certificate) → the
+    // admin pages stay on HTTP as before.
+    let https_port: u16 = args
+        .iter()
+        .position(|a| a == "--https-port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(443);
+    tls::HTTPS_PORT.store(https_port, std::sync::atomic::Ordering::Relaxed);
+    if https_port != 0 {
+        match tls::listen(&state, https_port).await {
+            Ok(l) => {
+                let https = app
+                    .clone()
+                    .layer(axum::middleware::from_fn(tls::secure_cookies));
+                info!(
+                    "web admin on https://{}:{https_port}",
+                    addr.split(':').next().unwrap_or("")
+                );
+                tokio::spawn(async move {
+                    use axum::serve::ListenerExt;
+                    // tap_io: axum's ConnectInfo<SocketAddr> for a listener of its own kind (the peer IP: login throttle).
+                    let l = l.tap_io(|io| {
+                        let _ = io.get_ref().0.set_nodelay(true);
+                    });
+                    if let Err(e) = axum::serve(
+                        l,
+                        https.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .await
+                    {
+                        error!("https server stopped: {e}");
+                    }
+                });
+            }
+            Err(e) => warn!("https: off ({e}) — the web admin stays on http://"),
+        }
+    }
+    let app = app.layer(axum::middleware::from_fn_with_state(state, tls::http_side));
 
     info!("bootrom-mgmt {VERSION} serving on http://{addr}");
     // ConnectInfo: /api/license and /api/booted identify the machine by the peer IP (license.rs).

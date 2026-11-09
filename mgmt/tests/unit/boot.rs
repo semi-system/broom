@@ -19,6 +19,7 @@ fn linux_share() {
 fn img(name: &str, def: bool) -> MenuImage {
     MenuImage {
         name: name.into(),
+        chain: format!("/boot/start?image={name}"),
         is_default: def,
     }
 }
@@ -32,6 +33,7 @@ fn menu_default_keys_ascii() {
         Some(3),
         true,
         false,
+        None,
     );
     assert!(s.starts_with("#!ipxe\n"));
     assert!(s.is_ascii(), "the iPXE font is ASCII only");
@@ -40,7 +42,7 @@ fn menu_default_keys_ascii() {
     assert!(s.contains("choose --default img1 --timeout 5000 sel || goto shell"));
     // A choice goes through the server (boot log + the image's script).
     assert!(s.contains(
-        ":img1\nchain /boot/start?image=win-11&mac=${net0/mac}&ip=${net0/ip} || goto start\n"
+        ":img1\nchain /boot/start?image=win-11&mac=${net0/mac}&ip=${net0/ip}&gw=${net0/gateway} || goto start\n"
     ));
     assert!(s.contains("set menu-footer Host: FPS-43x|IP: ${net0/ip}|MAC: ${net0/mac}\n"));
     assert!(s.contains("set broom-host FPS-43x\n"));
@@ -159,14 +161,14 @@ fn client_ids_validated() {
 
 #[test]
 fn menu_no_default_no_timeout() {
-    let s = menu_script(&[img("a", false)], 10, None, None, false, false);
+    let s = menu_script(&[img("a", false)], 10, None, None, false, false, None);
     assert!(s.contains("choose  sel || goto shell"));
     assert!(s.contains("Host: not registered|"));
     assert!(
         !s.contains("broom-host") && !s.contains("broom-lic") && !s.contains("broom-reg"),
         "unknown machine"
     );
-    let s = menu_script(&[], 10, None, None, false, false);
+    let s = menu_script(&[], 10, None, None, false, false, None);
     assert!(s.contains("item --key s shell [S] iPXE shell (no image yet"));
 }
 
@@ -174,7 +176,15 @@ fn menu_no_default_no_timeout() {
 /// images (number keys still map to images), still ASCII.
 #[test]
 fn menu_secure_boot_footer_as_gap_lines() {
-    let s = menu_script(&[img("win-11", true)], 5, Some("PC05"), None, true, true);
+    let s = menu_script(
+        &[img("win-11", true)],
+        5,
+        Some("PC05"),
+        None,
+        true,
+        true,
+        None,
+    );
     assert!(s.is_ascii());
     let item = s.find("item --key 1 img1 ").unwrap();
     let head = s
@@ -183,14 +193,16 @@ fn menu_secure_boot_footer_as_gap_lines() {
         )
         .unwrap();
     assert!(head < item && s.contains("item --gap Arrows/number to select, Enter to boot\n"));
-    assert!(!menu_script(&[img("a", false)], 5, None, None, false, false).contains("item --gap"));
+    assert!(
+        !menu_script(&[img("a", false)], 5, None, None, false, false, None).contains("item --gap")
+    );
 }
 
 /// [C] Capture is on every menu (also with no image yet), last, never the default.
 #[test]
 fn menu_has_capture_last() {
     for imgs in [vec![img("a", true)], vec![]] {
-        let s = menu_script(&imgs, 5, None, None, false, false);
+        let s = menu_script(&imgs, 5, None, None, false, false, None);
         let c = s.find("item --key c capture [C] Capture").unwrap();
         assert!(s.find("item --key").unwrap() < c || imgs.is_empty());
         assert!(s.contains(
@@ -198,6 +210,30 @@ fn menu_has_capture_last() {
         ));
         assert!(!s.contains("--default capture"));
     }
+}
+
+/// A machine waiting in the new-machines group: a line above the choices says so, and it is not "registered" for its
+/// disks (render passes reg = false) — the stage asks before partitioning, as for an unknown PC.
+#[test]
+fn menu_note_for_waiting_machine() {
+    let s = menu_script(
+        &[img("win-11", true)],
+        5,
+        Some("NEW-6A35EB"),
+        None,
+        false,
+        false,
+        Some(super::WAITING_NOTE),
+    );
+    assert!(s.is_ascii());
+    let note = s
+        .find("item --gap New PC: waiting for an admin to move it to its group\nitem --gap\n")
+        .unwrap();
+    assert!(note < s.find("item --key 1 img1 ").unwrap());
+    assert!(s.contains("set broom-host NEW-6A35EB\n") && !s.contains("broom-reg"));
+    // Server text is not quoted in the script: nothing iPXE would expand or run.
+    let s = menu_script(&[], 5, None, None, false, false, Some("a ${x} || shell #"));
+    assert!(s.contains("item --gap a x  shell \n"), "{s}");
 }
 
 #[test]

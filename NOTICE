@@ -17,3 +17,9 @@ efibootmgr, util-linux, dosfstools and others, under their own licenses (mostly 
 (BSD-2-Clause). SOURCES.txt inside the bundle lists every package with its exact version and source package; the
 corresponding source is in the Ubuntu archive (`apt-get source <package>=<version>`, or
 https://launchpad.net/ubuntu/+source/<package>/<version>). These are not covered by the Apache License above.
+
+mgmt/static/novnc/ holds noVNC 1.7.0 (https://github.com/novnc/noVNC, tag v1.7.0; npm @novnc/novnc 1.7.0), unmodified:
+its core library under the Mozilla Public License 2.0 and its bundled pako under the MIT license — see
+mgmt/static/novnc/README.broom.md, LICENSE.txt, LICENSE.MPL-2.0 and vendor/pako/LICENSE. The binary serves these files
+as they are (the Source Code Form) to the browser for the "Maintain in the browser" screen. They are not covered by
+the Apache License above.

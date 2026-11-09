@@ -53,7 +53,11 @@ $hook = if (Test-Path $hookf) { [IO.File]::ReadAllBytes($hookf) }
 Remove-Item $B -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory "$B\efi" | Out-Null
 if ($hook) { [IO.File]::WriteAllBytes($hookf, $hook); Write-Host '>>> keeping C:\broom\base-hook.ps1' -ForegroundColor Green }
-$vd = "$env:TEMP\broom-esp.vhdx"
+# The vdisks by their long path: diskpart's "select vdisk" + detach matches the path the vdisk was attached with, and
+# $env:TEMP is an 8.3 short path for Audit Mode's built-in Administrator (C:\Users\ADMINI~1\...). With it the detach
+# silently does nothing: the ESP vdisk keeps its letter and the BIOS vdisk stays locked -> no legacy BIOS files.
+$T = (Get-Item -LiteralPath $env:TEMP).FullName
+$vd = "$T\broom-esp.vhdx"
 Remove-Item $vd -ErrorAction SilentlyContinue
 $L = (69..90 | ForEach-Object { [char]$_ } | Where-Object { -not (Test-Path "${_}:\") } | Select-Object -Last 1)
 @"
@@ -84,7 +88,7 @@ Remove-Item $vd, "$env:TEMP\broom-esp.txt" -ErrorAction SilentlyContinue
 #     (its boot sector's "hidden sectors" and the BCD's partition reference then match p1 there), bootmgr + Boot\BCD by
 #     bcdboot /f BIOS, Windows' own MBR and boot sector code (written by diskpart / format). A fixed VHD is the raw disk
 #     + a 512-byte footer: the partition image (esp.img) and the MBR boot code (mbr.bin) are cut from the file itself.
-$vb = "$env:TEMP\broom-bios.vhd"
+$vb = "$T\broom-bios.vhd"
 Remove-Item $vb -ErrorAction SilentlyContinue
 @"
 create vdisk file="$vb" maximum=100 type=fixed
@@ -215,6 +219,9 @@ $ErrorActionPreference = 'Stop'
 Write-Host '>>> Sysprep... the VM will POWER OFF by itself. Then upload it on the web (OS = windows).' -ForegroundColor Green
 $tag = "$env:SystemRoot\System32\Sysprep\Sysprep_succeeded.tag"
 Remove-Item $tag -ErrorAction SilentlyContinue
+# Audit Mode opens the Sysprep window at every sign-in: a second sysprep.exe stops at "Another copy of this application
+# is already running" (and the prep fails). Close that idle window first.
+Get-Process sysprep -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Process -Wait "$env:SystemRoot\System32\Sysprep\sysprep.exe" -ArgumentList '/generalize', '/oobe', '/quit', "/unattend:$B\unattend.xml"
 if (-not (Test-Path $tag)) { throw 'sysprep failed - see C:\Windows\System32\Sysprep\Panther\setupact.log' }
 # Windows' OWN storage drivers (SATA/NVMe/RAID) start at boot on ANY client controller: native VHD boot needs the

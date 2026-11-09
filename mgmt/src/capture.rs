@@ -59,6 +59,7 @@ fn tool(srv: &str) -> Result<(), String> {
 
 /// Sign in with an owner account typed here (asked again after a wrong password or a staff account).
 fn login(srv: &str) -> Result<Api, String> {
+    let link = Link::to(srv);
     loop {
         let user = ask("Owner account [admin]: ")?;
         let user = if user.is_empty() {
@@ -66,7 +67,7 @@ fn login(srv: &str) -> Result<Api, String> {
         } else {
             user
         };
-        let api = Api::new(srv, user, ask_secret("Password: ")?);
+        let api = Api::new(&link, user, ask_secret("Password: ")?);
         match api.login() {
             Ok(()) => {}
             Err((401 | 429, m)) => {
@@ -684,26 +685,96 @@ fn wait_job(api: &Api, name: &str) -> Result<(), String> {
     }
 }
 
+/// How this tool reaches the server's web API. The web admin is on HTTPS (tls.rs): with the server's own self-signed
+/// certificate (the default) the tool trusts exactly that certificate, fetched from the server like this binary itself
+/// (GET /api/tls/cert; same trust as the boot, which is all plain HTTP from the same server). With a certificate the
+/// owner uploaded (made for a name, not this IP) the tool stays on plain HTTP, marked so the server lets it through.
+#[derive(Clone)]
+struct Link {
+    agent: ureq::Agent,
+    base: String,
+    /// Plain HTTP while the server is on HTTPS: send X-Broom-Tool.
+    plain: bool,
+}
+
+impl Link {
+    fn to(srv: &str) -> Link {
+        let cfg = || {
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(10)))
+                .timeout_global(Some(Duration::from_secs(300)))
+        };
+        let http = Link {
+            agent: cfg().build().into(),
+            base: format!("http://{srv}"),
+            plain: false,
+        };
+        let info: Value = match http
+            .agent
+            .get(format!("http://{srv}/api/tls/cert"))
+            .call()
+            .ok()
+            .filter(|r| r.status() == 200)
+            .and_then(|mut r| r.body_mut().read_to_string().ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+        {
+            Some(v) => v,
+            None => return http, // an older server: no HTTPS
+        };
+        let port = info["port"].as_u64().unwrap_or(0);
+        if port == 0 {
+            return http;
+        }
+        let host = srv.split(':').next().unwrap_or(srv);
+        let pem = info["cert"].as_str().unwrap_or("");
+        let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(pem.as_bytes())
+            .filter_map(|i| match i {
+                Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
+                _ => None,
+            })
+            .collect();
+        if info["self_signed"] != true || certs.is_empty() {
+            println!(
+                "  (the server uses an uploaded certificate: this tool talks plain HTTP to it, as the boot does)"
+            );
+            return Link {
+                plain: true,
+                ..http
+            };
+        }
+        let tls = ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::new_with_certs(&certs))
+            .build();
+        let base = if port == 443 {
+            format!("https://{host}")
+        } else {
+            format!("https://{host}:{port}")
+        };
+        Link {
+            agent: cfg().tls_config(tls).build().into(),
+            base,
+            plain: false,
+        }
+    }
+}
+
 /// The server's web API, signed in as one account.
 struct Api {
     agent: ureq::Agent,
     base: String,
+    plain: bool,
     user: String,
     pass: String,
     cookie: Mutex<String>,
 }
 
 impl Api {
-    fn new(srv: &str, user: String, pass: String) -> Api {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_global(Some(Duration::from_secs(300)))
-            .build()
-            .into();
+    fn new(link: &Link, user: String, pass: String) -> Api {
         Api {
-            agent,
-            base: format!("http://{srv}"),
+            agent: link.agent.clone(),
+            base: link.base.clone(),
+            plain: link.plain,
             user,
             pass,
             cookie: Mutex::new(String::new()),
@@ -719,17 +790,25 @@ impl Api {
     ) -> Result<(u16, Vec<u8>, Option<String>), String> {
         let url = format!("{}{path}", self.base);
         let ck = self.cookie.lock().clone();
+        let tool = if self.plain { "capture" } else { "" };
         let r = match method {
-            "GET" => self.agent.get(&url).header("Cookie", ck.as_str()).call(),
+            "GET" => self
+                .agent
+                .get(&url)
+                .header("Cookie", ck.as_str())
+                .header("X-Broom-Tool", tool)
+                .call(),
             "PUT" => self
                 .agent
                 .put(&url)
                 .header("Cookie", ck.as_str())
+                .header("X-Broom-Tool", tool)
                 .send(body),
             _ => self
                 .agent
                 .post(&url)
                 .header("Cookie", ck.as_str())
+                .header("X-Broom-Tool", tool)
                 .header("Content-Type", "application/json")
                 .send(body),
         };

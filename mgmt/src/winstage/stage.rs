@@ -21,9 +21,10 @@ fn stage_hook() -> &'static str {
 /// Tools of the machine building the bundle that the hook copies into the stage (/broom/bin, ahead of busybox).
 /// tee: the golden is hashed while downloading through `tee` — the initramfs busybox's copies one byte per write()
 /// (built without block I/O): ~240 KB/s for a golden instead of the network's speed. dmesg: the kernel's log goes
-/// into stage.log (busybox-initramfs has none).
-const STAGE_TOOLS: &str =
-    "sfdisk blkid mkfs.fat mkntfs ntfsfix efibootmgr wget sha256sum tee tar gzip od dd awk dmesg";
+/// into stage.log (busybox-initramfs has none). head: busybox-initramfs has none either (stage.sh needs it for the
+/// client config, the disk's ID and the UEFI boot entry); a build machine with more initramfs hooks (GitHub's runner)
+/// happens to bring coreutils' own, a plain Ubuntu does not → "Broom Windows entry not found" on the client.
+const STAGE_TOOLS: &str = "sfdisk blkid mkfs.fat mkntfs ntfsfix efibootmgr wget sha256sum tee tar gzip od dd awk dmesg head";
 
 /// Stage init-premount script — runs on the client, does NOT mount root; reboots into Windows when done.
 fn stage_script() -> &'static str {
@@ -107,6 +108,7 @@ fn build_stage(kernel: Option<&str>, sd: &str) -> Result<String, String> {
         "wget",
         "tee",
         "dmesg",
+        "head",
     ]
     .into_iter()
     .filter(|b| !list.lines().any(|l| l.ends_with(&format!("broom/bin/{b}"))))

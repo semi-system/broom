@@ -18,6 +18,9 @@ pub fn routes() -> Router<SharedState> {
         .route("/api/wake", post(wake))
 }
 
+/// A machine that chose from its boot menu this long ago and is not up yet counts as booting.
+const BOOTING_S: u64 = 300;
+
 #[derive(Serialize)]
 struct MachineStatus {
     mac: String,
@@ -54,6 +57,11 @@ struct MachineStatus {
     /// The DNS server refuses its names now (dns.rs); None = DNS server off / no IP.
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_blocked: Option<bool>,
+    /// The last power action sent to it while it plays out (power.rs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    power: Option<crate::power::Pending>,
+    /// Network-booted in the last few minutes and not up yet (no agent, no ping answer).
+    booting: bool,
 }
 
 /// Machines = registered (machines table) + discovered via DHCP (leases table, dhcp.rs) or a PXE boot (pxe_ip).
@@ -146,6 +154,7 @@ async fn status(State(st): State<SharedState>) -> Json<Vec<MachineStatus>> {
         .collect();
     let not_reset = st.not_reset.lock().clone();
     let ssd_low = st.ssd_low.lock().clone();
+    let pxe = st.pxe_seen.lock().clone();
     let mut out: Vec<MachineStatus> = entries
         .into_iter()
         .zip(online)
@@ -167,6 +176,11 @@ async fn status(State(st): State<SharedState>) -> Json<Vec<MachineStatus>> {
                 traffic: ip.as_deref().and_then(crate::sysmon::traffic),
                 agent_since: crate::vnc::since(&mac),
                 dns_blocked: ip.as_deref().and_then(crate::dns::blocked),
+                power: crate::power::pending(&mac),
+                booting: !online
+                    && pxe
+                        .get(&mac)
+                        .is_some_and(|t| crate::now_secs().saturating_sub(*t) <= BOOTING_S),
                 mac,
                 ip,
                 hostname,

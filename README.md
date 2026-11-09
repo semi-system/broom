@@ -23,6 +23,10 @@ labs, up to ~100 PCs per server (see [Sizing](#sizing)).
   live follow.
 - **Versions of every golden**: snapshot and roll back; on XFS / btrfs versions share their common data, so each one
   costs only what changed. Whatever is served stays in one piece on the disk.
+- **Diskless machines (no SSD)** as a second mode: the whole disk comes from the server over iSCSI, each machine with
+  its own layers, reset at every boot; a new PC's network card is added to the golden from the browser, and goldens
+  are maintained in a VM on the server ([details](#diskless-machines-no-ssd)).
+- **Power, display, hardware list** per machine or group; **HTTPS** for the web admin.
 - **Machine groups, driver packages.** Free, Apache-2.0.
 
 **User guide:** [step by step, from an empty server to a room in daily use](https://broom.hainth.edu.vn/user-guide.html) ·
@@ -64,7 +68,8 @@ their own layer over it. Every boot resets to `base ← drivers ← fresh child`
 
 - **Server:** x86_64 Linux (tested on Debian/Ubuntu and Rocky Linux 10), run as root, disk space for the goldens.
 - **Clients:** x86_64 PCs, UEFI or legacy BIOS (CSM), **PXE first in the boot order**. Windows images need a local
-  SSD; Linux images can run without one (writes in RAM).
+  SSD; Linux images can run without one (writes in RAM). [Diskless goldens](#diskless-machines-no-ssd) run Windows (or
+  Linux) with no disk at all, entirely from the server (tested on UEFI clients only).
 
 ## Sizing
 
@@ -108,7 +113,9 @@ Windows publish fetches `broom-stage.tar.gz` (client stage). The binary takes th
 **Offline server:** copy both files of the same release next to the binary. To upgrade: stop the service, replace the
 binary (checked the same way), start it.
 
-Open `http://<server-ip>/`, enter the setup token and set the owner password. Then the network boot:
+Open `http://<server-ip>/`: it moves to `https://` with the server's self-signed certificate, so the browser warns
+once (the fingerprint is on **Settings → HTTPS**; see [Web admin](#web-admin)). Enter the setup token and set the owner
+password. Then the network boot:
 
 - **Keep the router's DHCP** and set its PXE options: next-server / option 66 = the Broom server, boot file /
   option 67 = `snponly.efi` (Secure Boot clients: `sb/snponly-shim.efi`; legacy BIOS clients: `undionly.kpxe`; a
@@ -170,14 +177,129 @@ Upload the powered-off VM folder (only `.vmx` / `.vmdk` are sent, in parallel ch
   agent runs, PCs that just booted, and exempt groups / IPs. Block outside DNS (53, 853) on the router.
 - **Remote:** a small agent (`broom-vnc`) dials out to the server; the wall streams only the page shown, the single
   view uses H.264 on Chrome / Edge. Ctrl+Alt+Del, Windows key, Alt+Tab and Paste from the toolbar.
+- **Hardware list** (Machines page → Hardware; **Hardware CSV** for all): Windows, computer, board + BIOS, CPU, RAM
+  sticks, graphics cards + driver version, drives, network cards + link speed, monitors and each output's current mode
+  and the modes it offers — sent by the agent once connected, 2 minutes later (games disks mounted) and every 30
+  minutes, kept per machine.
+- **Display** (Machines page, owner): resolution + refresh per machine (picked from the modes its monitor offers, in
+  its Hardware panel) or for the selected machines / a group (typed, e.g. `1920x1080@165`; a machine's own setting wins
+  over its group's). The agent applies it to the main output at every start — only a mode the monitor offers, tested
+  first — and at once when changed.
+- **Power** (Machines page; staff too): tick machines (or all a filter shows, e.g. one group), then **Turn on**
+  (Wake-on-LAN: on in the PC's firmware), **Restart** or **Shut down** (now, or after 30 s / 1 / 5 min with an optional
+  message on screen; through the PC's agent, which runs Windows' `shutdown`) or **Cancel** a countdown. A machine
+  without a connected agent is listed as not done. `POST /api/power {action, ids | group, delay, msg}` for scripts.
 
 The Windows scripts and helpers are the server's, not the image's: a new server version reaches every PC at its next
 boot without a republish.
+
+## Diskless machines (no SSD)
+
+A **golden** (Diskless page) is a whole disk that machines with no local disk boot straight from the server over
+iSCSI (iPXE `sanboot`, the iBFT tells the OS where its disk is). Every read and write goes to the server: size it for
+that (fast disks for the machines' layers, the server's link) and keep in mind that the server down = every diskless
+PC down.
+
+- **Create:** name, OS (Windows by default, or Linux), size, the **installer ISO** from the ISO library, and the
+  groups whose machines boot it. It starts as a blank disk.
+- **Install / maintain:** pick its **maintenance machine**. Its boot menu then has *Install … from …* (the golden
+  attached as a blank disk, the ISO booted as a DVD drive) and *Maintain …* (the golden itself, writable). Install
+  the OS, then drivers, software and settings; shut down; **Save** makes that work the golden's next version, which
+  every machine gets at its next boot (**Discard** throws it away). Windows ISOs ask to press a key to boot from the
+  DVD: press one on the maintenance machine.
+- **Machines:** registered machines of the golden's groups with a **fixed IP**. Each gets its own disk (target
+  `<golden>.m<mac>`, answered only from its IP with its MAC behind it): the golden, then the machine's own **base**
+  layer, then a **session** layer that is wiped at every PXE boot.
+- **Storage** (Diskless page): goldens, the machines' layers and the ISO library each go on broom's own folder or a
+  server disk. Layers are sparse files of 64 KB blocks: a machine costs what it writes.
+- **ISO library:** upload installer ISOs (Windows or Linux); they are served read-only as a DVD-ROM.
+- **Linux goldens:** an Ubuntu installer ISO (casper) is not booted as a DVD (its live system cannot find it there):
+  Broom boots the ISO's own kernel and initrd, the live system loads the whole ISO over HTTP (the machine needs about
+  4 GB of RAM more than the ISO) and an autoinstall seed that only adds steps around the usual screens: log in to the
+  golden before the disks are probed, and set the installed system up for it (`broom-diskless.sh`: the initramfs logs
+  in to the disk the network boot describes, no swap on the network disk, each machine's own name / machine-id / SSH
+  host keys on its first boot). Another Debian / Ubuntu install: run `curl -fsS http://<server>/broom-diskless.sh |
+  sudo sh` on it once before Save. Linux goldens boot their distribution's shim (`\EFI\<distro>\shimx64.efi`), not
+  `\EFI\BOOT\BOOTX64.EFI`: that one is shim's fallback, which adds a firmware boot entry and restarts every time.
+- **Windows goldens:** run `irm http://<server>/broom-diskless.ps1 | iex` on the golden (as Administrator) before
+  the first Save: each machine then takes its own name (Devices page) on its first boot, kept as its base. At every
+  start the golden's copy runs the server's current version of the script, so a newer Broom reaches every machine
+  without a new golden version. A golden set up before that: **Update script** (Diskless page) writes the current
+  script into it as its next version, without booting it.
+- **Games disks on diskless machines:** a diskless Windows machine has no SSD for its writes, so each one gets its own
+  copy of every games disk of its group on the server (target `<disk iqn>.m<mac>`: the disk's newest version + the
+  machine's own layer in `<writeback>/.games-<disk>/<mac>/`, dropped at its next PXE boot — like the per-PC writeback
+  of commercial diskless systems). `broom-games.ps1` (run by `broom-watch.ps1 -Dir` at start and every 5
+  minutes) logs in to it and attaches its `games.vhdx` writable as the disk's letter. The disk's update machine (a
+  diskless one too) gets the disk itself, writable, as on SSD machines; Save makes the next version, which every
+  machine's copy reads from its next boot.
+- **Maintain in the browser (Windows):** the Diskless page runs a golden in a VM on the server (QEMU/KVM, 4 CPU
+  threads, 8 GB, internet through QEMU's NAT) and shows its screen in the browser (**Open the screen**: noVNC,
+  through Broom's signed-in WebSocket; QEMU's VNC is only a Unix socket). Tick games disks to attach them **writable**
+  under their letters, as for an update machine: install or update games, shut the VM down, then **Save** each disk —
+  every machine gets it at its next boot. An owner can tick *Keep Windows changes* (Windows / app updates): Save or
+  Discard the golden afterwards; without it the VM's Windows changes are thrown away when it stops, so staff (who may
+  start it) update games but never change the golden. The VM writes through the server's own iSCSI sessions (the
+  daemon lets 127.0.0.1 write while the VM holds the disks) and runs in its own systemd unit `broom-vm-<golden>`, so
+  restarting Broom does not stop it. One VM at a time; the golden needs no maintenance machine. Needs
+  `qemu-system-x86`, `ovmf`, `open-iscsi` and KVM, as Add hardware. In the VM, Steam and other sign-ins are lost with
+  the Windows changes unless they are kept.
+- **Remote on diskless machines:** the first boot of each golden version also gets the machine its Remote agent key
+  (handed out only on that boot) and the agent's files (`C:\ProgramData\Broom`, SYSTEM and Administrators only), kept
+  in its base; every later boot starts the agent (`broom-watch.ps1 -Dir`, its own task), so remote screen, Wake and
+  health work as on SSD machines. A new key (Re-issue on Devices) builds the base again. The maintenance machine gets
+  no key: what it writes goes into the golden.
+- **Add hardware (Windows):** Windows booting from iSCSI only brings up a network card whose *device* it already
+  knows (its exact Plug and Play instance ID: bus + slot); a driver alone is not enough. For a PC with a card the
+  golden has never seen (a new board, or a card in another slot), pick the golden and that PC under *Add hardware*
+  and press Start. Its next network boot starts Windows PE (wimboot + the Windows PE of the golden's installer ISO;
+  Microsoft-signed, so it also works with *Secure Boot clients*), which reports its cards to Broom. Broom attaches the
+  golden's newest version to itself (iSCSI over 127.0.0.1), boots it in a small VM (QEMU/KVM, no network) where
+  `broom-onboard.ps1`, run by the golden's own startup task, creates each card's device with that instance ID and lets
+  Windows install the best driver from its driver store, marked as a network-boot driver; then Broom saves the golden's
+  next version and the PC restarts into it. Identical PCs need it once; a PC whose cards are all known finishes at
+  once. Needs on the server: `qemu-system-x86_64`, OVMF, `iscsiadm` (open-iscsi), `ntfs-3g` and `/dev/kvm` (nested
+  KVM, CPU type host, when Broom itself runs in a VM). The card needs a driver in Windows PE (to report) and in the
+  golden (to install). **Network-card drivers from the library** (Drivers page; packages whose .inf is Class=Net are
+  marked *network card*): every one of them goes to Windows PE along with the reporter, which loads them (`drvload`)
+  before it looks for the network, and the package matching the card is copied into the golden and added to its driver
+  store before the card is installed. iPXE tells Broom the card it booted with (vendor + device) before Windows PE
+  starts, so a card Windows PE still cannot use is named on the Diskless page (and on the PC's screen) with what to do.
+  A card without a driver in Windows PE but a second card that has one is reported too (from the problem devices). The Windows PE files come out of the ISO's ISO 9660 part; Microsoft's own ISOs keep them in UDF
+  only: copy `boot.wim`, `boot.sdi`, `bootmgr.efi` and the UEFI `BCD` into `<ISO place>/.winpe/<iso>/` then.
+- **Versions** (the *kept* versions under each golden on the Diskless page and each disk on the iSCSI Disks page; a
+  version per group on the Groups page): every saved version of a golden or games disk is kept until the drive holding
+  it has less than the % free set under *Where things are kept* (default 10); then the oldest one that no machine uses and no
+  group is held on goes, one at a time. A group boots the **newest** version or one it is **held** on: put a test PC's
+  group on the newest, keep the room on the last good one, then move the room once the test PC is fine. Machines pick
+  a change up at their next boot. The owner can also drop the oldest version by hand.
+- **Behind a router's DHCP** (Broom's DHCP server off): the router's boot file `sb/snponly-shim.efi` (the
+  Microsoft-signed iPXE shim) works for every PC, Secure Boot on or off; each diskless PC needs a **fixed lease** on the
+  router equal to its fixed IP in Broom (its disk answers only that IP). Windows booted from iSCSI turns the gateway it
+  is booted with into a route to its disk *through* that gateway, even on the same subnet, so every disk read would
+  go through the router (and a router that tracks connections drops Windows' new connections to Broom). When Broom is
+  on the PC's subnet, the Windows boot leaves the gateway out and the startup script adds the router as the default
+  route once the disk is up. After moving Broom to another address, **Update script** (Diskless page) writes the new
+  address into the golden.
+
+**Tested so far**, on virtual-machine clients: Windows 11 24H2 and Ubuntu 26.04 goldens end to end — installed from the
+library (the golden attached, the installer from the server), maintained, saved, then booted diskless: each machine's
+own name kept as its base, everything else gone at the next boot. Add hardware: an e1000e in a PCI slot the golden had
+never seen and an RTL8139 (another driver) under Secure Boot hung at the Windows spinner before, booted after (Windows
+PE report → VM → new version in about 2 minutes), and a vmxnet3 card Windows PE has no driver for booted after its
+driver came from the driver library. On a LAN behind a router's DHCP: three clients (e1000e, vmxnet3, RTL8139 with
+Secure Boot) booted Windows with the Secure Boot shim, Remote agent, games disk and internet; a golden updated in the
+browser VM booted on them; a group held on an older version booted it while a newer one existed. Not tested yet: real
+PCs (their network card in Windows PE and in the iSCSI boot), production load, and anti-cheat behind this chain.
 
 ## Groups, images, versions
 
 - A machine's **group** decides its boot menu, the images kept on its SSD, its iSCSI disks and drivers (Groups page).
   Things set for no group go to everyone. This organizes, it is not access control.
+- **New machines** (Groups page, off by default): an unknown PC that network-boots joins a group you pick by itself
+  (named `NEW-<end of its MAC>`, its IP as fixed IP) and waits there until you move it to its group. Meanwhile it
+  boots what that group gets, and its disks are never partitioned without asking. Only PCs on the server's own LAN
+  (MAC seen behind the IP), at most 250 waiting.
 - **Preload** (Windows images): PCs fetch the image ahead of use while booting another one.
 - **Versions:** **+ Snapshot now** saves the golden as a version (a hard link: instant, no space). The first upload
   of an image is saved as v1. **→ New image** turns a version into an image; **Delete** frees what no other version
@@ -204,6 +326,17 @@ boot without a republish.
 | Tools | **Benchmark**, **Logs** |
 
 Accounts: **owner** (everything) or **staff** (look, Remote, Wake, save a games update; no deleting or settings).
+
+**HTTPS.** The web admin is served on `https://` (port 443, `--https-port` to change it, `--https-port 0` = off);
+plain `http://` sends a browser there and refuses the admin API. The machines keep plain HTTP: iPXE, the boot files,
+Windows PE, the Remote agents and the scripts on the PCs. At first start Broom makes a **self-signed certificate** for
+its host name and addresses (valid 820 days, under Apple's 825-day limit; a new one is made by itself a month before
+the end). A browser warns the first time: compare the SHA-256 fingerprint it shows with **Settings → HTTPS**, or
+install the certificate on the staff PCs (Download there). **Your own certificate** (PEM certificate with its chain +
+its private key) replaces it on the same card, at once (no restart); so does a new self-signed one (after an address
+change). Files: `<home>/tls/cert.pem`, `key.pem` (root only). The Capture tool (boot menu [C]) trusts exactly the
+server's self-signed certificate; with your own certificate it talks plain HTTP, as the boot does. A switch on the
+card serves the admin on plain `http://` too.
 
 ## Data, backup
 
@@ -244,12 +377,14 @@ account's salt and a server nonce → a proof made from the password (PBKDF2-SHA
 the server's own proof back. The server keeps only a verifier per account, so a copied database logs nobody in, and a
 sniffed sign-in gives neither the password nor a reusable proof. A new password (first owner, change, reset by an
 owner) travels as its verifier sealed with the session's key (the first one with the setup token, never typed
-anywhere but the page). The session cookie itself still travels in the clear. What the network must do:
+anywhere but the page). The web admin is on HTTPS (see Web admin): the session cookie is `Secure`, so a browser never
+sends it over plain HTTP. What the network must do:
 
 - **Segment the boot LAN.** The goldens (HTTP) and iSCSI (`:3260`) are readable by any host on it. Keep guest Wi-Fi
   and unknown laptops off it, and keep real secrets out of goldens.
-- **Isolate the admin PC** or turn on port isolation: the web admin is plain HTTP, so a host that can redirect its
-  traffic (ARP spoofing from a guest PC) could take over a session or change the pages; port isolation stops that.
+- **Check the certificate** the first time a browser shows the admin page (fingerprint on Settings → HTTPS), or
+  install it on the staff PCs: a browser told to accept any certificate can be shown a fake one by a host that
+  redirects its traffic (ARP spoofing from a guest PC). Port isolation stops that kind of redirection too.
 - License keys go to a PC once, over plain HTTP, while its base is built.
 - iSCSI writes are accepted only from a disk's update machine (IP + MAC).
 - Remote agents dial out; each PC has its own key, both sides prove it at every connection and every command is signed.
@@ -286,8 +421,8 @@ mgmt/
 
 ## FAQ
 
-**Do the clients need a disk?** Windows: yes, a local SSD (cache + session writes keep boots fast and the server
-idle). Linux: no.
+**Do the clients need a disk?** Windows images: yes, a local SSD (cache + session writes keep boots fast and the
+server idle). Linux: no. [Diskless goldens](#diskless-machines-no-ssd): no disk at all, the server carries the load.
 
 **How many machines?** About 100 per server with the hardware in [Sizing](#sizing). The rooms running it today are
 small: grow gradually and watch the Server page.

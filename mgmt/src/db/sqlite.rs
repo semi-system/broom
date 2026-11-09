@@ -601,6 +601,16 @@ impl Db for Sqlite {
         Ok(c.last_insert_rowid())
     }
 
+    fn add_machine_row(&self, m: &Machine) -> DbResult<i64> {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO machines(mac,ip,hostname,grp,notes) VALUES(?1,?2,?3,?4,?5)",
+            params![m.mac, m.ip, m.hostname, m.grp, m.notes],
+        )
+        .map_err(e)?;
+        Ok(c.last_insert_rowid())
+    }
+
     fn leases(&self) -> DbResult<Vec<Lease>> {
         self.all("SELECT mac,ip,hostname,expires FROM leases", [], |r| {
             Ok(Lease {

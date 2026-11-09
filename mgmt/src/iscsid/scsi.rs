@@ -198,6 +198,233 @@ fn mode_sense(cdb: &[u8; 16], writable: bool) -> Cmd {
     Cmd::Data(d)
 }
 
+// ---------- CD-ROM (MMC): an installer ISO, read-only ----------
+//
+// Installer ISOs are served as a CD-ROM device so that UEFI (El Torito) boots them and Windows mounts them with its CD
+// stack (cdrom.sys + UDF) after it logs in from the iBFT, exactly as a DVD drive: Windows Setup then finds its install
+// image on it. The MMC subset Windows, UEFI and iPXE use for a read-only DVD-ROM with one data track; everything else is
+// ILLEGAL REQUEST (drives without a feature answer the same).
+
+/// 2048-byte sectors (DVD-ROM).
+pub const CD_BLOCK: u64 = 2048;
+/// DVD-ROM profile (GET CONFIGURATION).
+const PROFILE_DVD_ROM: u16 = 0x0010;
+
+/// Answer a CDB for a read-only DVD-ROM of `size` bytes holding one data track.
+pub fn handle_cd(cdb: &[u8; 16], size: u64, id: &str) -> Cmd {
+    let nblocks = size.div_ceil(CD_BLOCK);
+    let read = |lba: u64, blocks: u64| match lba.checked_add(blocks) {
+        _ if blocks > MAX_READ_BLOCKS * BLOCK / CD_BLOCK => Cmd::Check(ILLEGAL_REQUEST, 0x24, 0x00),
+        Some(end) if end <= nblocks => Cmd::Read {
+            lba,
+            blocks: blocks as u32,
+        },
+        _ => Cmd::Check(ILLEGAL_REQUEST, 0x21, 0x00),
+    };
+    let alloc = |d: Vec<u8>, len: usize| Cmd::Data(d.into_iter().take(len).collect());
+    match cdb[0] {
+        // TUR, START STOP, PREVENT ALLOW, SET CD SPEED, MODE SELECT(6/10), SYNC CACHE: nothing to do.
+        0x00 | 0x1b | 0x1e | 0xbb | 0x15 | 0x55 | 0x35 => Cmd::Ok,
+        0x03 => Cmd::Data(sense(0, 0, 0)),
+        0x12 if cdb[1] & 1 == 0 => {
+            if cdb[2] != 0 {
+                return Cmd::Check(ILLEGAL_REQUEST, 0x24, 0x00);
+            }
+            // Standard data: CD/DVD device, removable, SPC-3.
+            let pad = |s: &str, n: usize| format!("{s:<n$}").into_bytes()[..n].to_vec();
+            let mut d = vec![0x05, 0x80, 0x05, 0x02, 31, 0, 0, 0];
+            d.extend(pad("BROOM", 8));
+            d.extend(pad("ISO", 16));
+            d.extend(pad("1.0", 4));
+            alloc(d, be(&cdb[3..5]) as usize)
+        }
+        0x12 => match inquiry(cdb, nblocks, id) {
+            // Same pages as a disk; the page header names a CD/DVD device.
+            Cmd::Data(mut d) => {
+                d[0] = 0x05;
+                Cmd::Data(d)
+            }
+            c => c,
+        },
+        0x25 => {
+            let last = nblocks.saturating_sub(1).min(0xffff_ffff) as u32;
+            Cmd::Data([last.to_be_bytes(), (CD_BLOCK as u32).to_be_bytes()].concat())
+        }
+        0x28 | 0xa8 if cdb[1] >> 5 != 0 => Cmd::Check(ILLEGAL_REQUEST, 0x24, 0x00),
+        0x28 => read(be(&cdb[2..6]), be(&cdb[7..9])),
+        0xa8 => read(be(&cdb[2..6]), be(&cdb[6..10])),
+        // READ CD: user data of data sectors only (what a DVD-ROM's sectors hold).
+        0xbe if cdb[9] & 0xf8 == 0x10 && cdb[1] & 0x1c != 0x04 => {
+            read(be(&cdb[2..6]), be(&cdb[6..9]))
+        }
+        0x43 => read_toc(cdb, nblocks),
+        0x46 => get_configuration(cdb),
+        0x4a => event_status(cdb),
+        0x51 if cdb[1] & 0x07 == 0 => {
+            // READ DISC INFORMATION: finalized disc, one complete session, track 1.
+            let mut d = vec![0u8; 34];
+            d[1] = 32;
+            d[2] = 0x0e;
+            d[3] = 1;
+            d[4] = 1;
+            d[5] = 1;
+            d[6] = 1;
+            d[7] = 0x20; // URU
+            d[16..20].copy_from_slice(&[0xff; 4]); // last session lead-in: none
+            d[20..24].copy_from_slice(&[0xff; 4]); // last possible lead-out: none
+            alloc(d, be(&cdb[7..9]) as usize)
+        }
+        0xbd => alloc(vec![0u8; 8], be(&cdb[8..10]) as usize), // MECHANISM STATUS: idle, no changer
+        0xad if cdb[7] == 0x01 => {
+            // READ DVD STRUCTURE, copyright: no protection, all regions.
+            alloc(vec![0, 6, 0, 0, 0, 0, 0, 0], be(&cdb[8..10]) as usize)
+        }
+        0x1a | 0x5a => cd_mode_sense(cdb),
+        0xa0 => {
+            let mut d = vec![0u8; 16];
+            d[3] = 8;
+            Cmd::Data(d)
+        }
+        // Any write: the disc is read-only.
+        0x0a | 0x2a | 0xaa | 0x2e | 0x41 | 0x93 | 0x42 | 0x8a => {
+            Cmd::Check(DATA_PROTECT, 0x27, 0x00)
+        }
+        _ => Cmd::Check(ILLEGAL_REQUEST, 0x20, 0x00),
+    }
+}
+
+/// LBA → MSF bytes (minute, second, frame) with the 2-second lead-in, as READ TOC answers with MSF set.
+fn msf(lba: u64) -> [u8; 4] {
+    let f = lba + 150;
+    [
+        0,
+        (f / 75 / 60).min(255) as u8,
+        (f / 75 % 60) as u8,
+        (f % 75) as u8,
+    ]
+}
+
+/// READ TOC/PMA/ATIP: format 0 (TOC: track 1 + lead-out) and 1 (session info).
+fn read_toc(cdb: &[u8; 16], nblocks: u64) -> Cmd {
+    let use_msf = cdb[1] & 0x02 != 0;
+    let addr = |lba: u64| {
+        if use_msf {
+            msf(lba)
+        } else {
+            (lba.min(0xffff_ffff) as u32).to_be_bytes()
+        }
+    };
+    let format = match cdb[2] & 0x0f {
+        0 if cdb[9] >> 6 != 0 => cdb[9] >> 6, // older drives' format field
+        f => f,
+    };
+    let mut d = match format {
+        0 => {
+            if cdb[6] > 1 && cdb[6] != 0xaa {
+                return Cmd::Check(ILLEGAL_REQUEST, 0x24, 0x00); // no such track
+            }
+            let mut d = vec![0, 0, 1, 1];
+            if cdb[6] <= 1 {
+                d.extend([0, 0x14, 1, 0]);
+                d.extend(addr(0));
+            }
+            d.extend([0, 0x14, 0xaa, 0]);
+            d.extend(addr(nblocks));
+            d
+        }
+        1 => {
+            let mut d = vec![0, 0, 1, 1, 0, 0x14, 1, 0];
+            d.extend(addr(0));
+            d
+        }
+        _ => return Cmd::Check(ILLEGAL_REQUEST, 0x24, 0x00),
+    };
+    let n = (d.len() - 2) as u16;
+    d[..2].copy_from_slice(&n.to_be_bytes());
+    Cmd::Data(d.into_iter().take(be(&cdb[7..9]) as usize).collect())
+}
+
+/// GET CONFIGURATION: a DVD-ROM with the features a reader has.
+fn get_configuration(cdb: &[u8; 16]) -> Cmd {
+    let rt = cdb[1] & 0x03;
+    let start = be(&cdb[2..4]) as u16;
+    let feature = |code: u16, flags: u8, body: Vec<u8>| {
+        let mut f = code.to_be_bytes().to_vec();
+        f.push(flags);
+        f.push(body.len() as u8);
+        f.extend(body);
+        (code, f)
+    };
+    let mut random = (CD_BLOCK as u32).to_be_bytes().to_vec();
+    random.extend([0, 1, 0, 0]);
+    let all = [
+        feature(
+            0x0000,
+            0x03,
+            [PROFILE_DVD_ROM.to_be_bytes().to_vec(), vec![0x01, 0]].concat(),
+        ),
+        feature(0x0001, 0x0b, vec![0, 0, 0, 1, 0, 0, 0, 0]), // Core: SCSI interface
+        feature(0x0002, 0x07, vec![0x02, 0, 0, 0]),          // Morphing: polled events
+        feature(0x0003, 0x03, vec![0x29, 0, 0, 0]),          // Removable medium: tray, eject, lock
+        feature(0x0010, 0x01, random),                       // Random readable: 2048-byte blocks
+        feature(0x001f, 0x05, vec![0, 0, 0, 0]),             // DVD read
+    ];
+    let mut d = vec![0u8; 8];
+    d[6..8].copy_from_slice(&PROFILE_DVD_ROM.to_be_bytes());
+    for (code, f) in all {
+        let take = match rt {
+            2 => code == start,
+            _ => code >= start,
+        };
+        if take {
+            d.extend(f);
+        }
+    }
+    let n = (d.len() - 4) as u32;
+    d[..4].copy_from_slice(&n.to_be_bytes());
+    Cmd::Data(d.into_iter().take(be(&cdb[7..9]) as usize).collect())
+}
+
+/// GET EVENT STATUS NOTIFICATION (polled only): media class — a disc is present, nothing changed.
+fn event_status(cdb: &[u8; 16]) -> Cmd {
+    if cdb[1] & 0x01 == 0 {
+        return Cmd::Check(ILLEGAL_REQUEST, 0x24, 0x00); // asynchronous: not supported
+    }
+    let d = if cdb[4] & 0x10 != 0 {
+        vec![0, 6, 0x04, 0x10, 0, 0x02, 0, 0]
+    } else {
+        vec![0, 2, 0x80, 0x10] // NEA: no class asked for that we have
+    };
+    Cmd::Data(d.into_iter().take(be(&cdb[7..9]) as usize).collect())
+}
+
+/// MODE SENSE for a DVD-ROM: the capabilities page (2Ah) only.
+fn cd_mode_sense(cdb: &[u8; 16]) -> Cmd {
+    let page = match cdb[2] & 0x3f {
+        0x2a | 0x3f => {
+            let mut p = vec![0u8; 22];
+            p[0] = 0x2a;
+            p[1] = 20;
+            p[2] = 0x08 | 0x01; // reads DVD-ROM, CD-R
+            p[6] = 0x29; // tray, eject, lock
+            p
+        }
+        _ => return Cmd::Check(ILLEGAL_REQUEST, 0x24, 0x00),
+    };
+    let d = if cdb[0] == 0x1a {
+        [vec![(3 + page.len()) as u8, 0, 0, 0], page].concat()
+    } else {
+        let len = (6 + page.len()) as u16;
+        [len.to_be_bytes().to_vec(), vec![0, 0, 0, 0, 0, 0], page].concat()
+    };
+    let max = if cdb[0] == 0x1a {
+        cdb[4] as usize
+    } else {
+        be(&cdb[7..9]) as usize
+    };
+    Cmd::Data(d.into_iter().take(max).collect())
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/iscsid/scsi.rs"]
 mod tests;

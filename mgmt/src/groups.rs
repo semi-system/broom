@@ -22,6 +22,7 @@ pub fn routes() -> Router<SharedState> {
         .route("/api/groups/rename", post(rename))
         .route("/api/groups/delete", post(delete))
         .route("/api/groups/set", post(set))
+        .route("/api/groups/new-machines", post(set_new_machines))
 }
 
 fn saved(st: &SharedState) -> Vec<String> {
@@ -47,7 +48,8 @@ fn rename_everywhere(st: &SharedState, from: &str, to: Option<&str>) -> Result<(
     for key in ["groups", "hide_disks_groups", "dns_exempt_groups"] {
         edit_names(st, key, |v| *v = swap(v, from, to))?;
     }
-    Ok(())
+    crate::pins::rename_group(st, from, to)?; // the versions it is held on follow it
+    rename_new_machines(st, from, to)
 }
 
 fn same(a: &str, b: &str) -> bool {
@@ -94,6 +96,10 @@ fn all(st: &SharedState) -> Vec<String> {
         .iter()
         .flat_map(|d| d.groups.iter())
         .for_each(|g| add(g));
+    crate::diskless::goldens(st)
+        .iter()
+        .flat_map(|g| g.groups.iter())
+        .for_each(|g| add(g));
     v.sort_by_key(|g| g.to_ascii_lowercase());
     v
 }
@@ -115,15 +121,127 @@ async fn list(State(st): State<SharedState>) -> Json<serde_json::Value> {
         .iter()
         .map(|i| serde_json::json!({"id": i.id, "name": i.name, "os": i.os, "groups": i.groups}))
         .collect();
+    // The versions kept of each golden / games disk (version pickers).
+    let (dl, gs) = tokio::task::spawn_blocking(|| {
+        (
+            crate::iscsi::diskless_status().unwrap_or_default(),
+            crate::iscsi::games_status().unwrap_or_default(),
+        )
+    })
+    .await
+    .unwrap_or_default();
+    let kept = |i: Option<&crate::iscsid::games::Info>| -> Vec<u64> {
+        i.map(|i| {
+            let mut v: Vec<u64> = i.versions.iter().map(|x| x.ver).collect();
+            if v.is_empty() {
+                v.push(i.ver);
+            }
+            v
+        })
+        .unwrap_or_default()
+    };
     let disks: Vec<_> = crate::games::disks(&st)
         .iter()
-        .map(|d| serde_json::json!({"name": d.name, "letter": d.letter, "groups": d.groups}))
+        .map(|d| {
+            serde_json::json!({"name": d.name, "letter": d.letter, "groups": d.groups, "pins": d.pins,
+                "versions": kept(gs.iter().find(|x| x.name == d.name))})
+        })
         .collect();
     let drivers: Vec<_> = st.db.drivers().unwrap_or_default().iter().map(|d| serde_json::json!({"id": d.id, "name": d.name, "all": d.all_machines, "groups": d.groups})).collect();
+    // Diskless goldens: their groups' machines boot them (no group = no machine).
+    let goldens: Vec<_> = crate::diskless::goldens(&st)
+        .iter()
+        .map(|g| {
+            serde_json::json!({"name": g.name, "os": g.os, "groups": g.groups, "pins": g.pins,
+                "versions": kept(dl.iter().find(|x| !x.games && x.disk.name == g.name).map(|x| &x.disk))})
+        })
+        .collect();
     Json(serde_json::json!({
         "groups": all(&st), "machines": machines, "images": images, "disks": disks, "drivers": drivers,
+        "goldens": goldens,
         "hide_disks": crate::disks::hidden_groups(&st),
+        "new_machines": crate::machines::new_group(&st),
     }))
+}
+
+#[derive(Deserialize)]
+struct NewMachinesBody {
+    /// "" / null = off.
+    #[serde(default)]
+    group: Option<String>,
+}
+
+/// POST /api/groups/new-machines {group} — an unknown PC that network-boots joins `group` by itself (named
+/// NEW-<end of its MAC>, its current IP as fixed IP) and waits there for an admin to move it to its group; its disks
+/// are never partitioned without asking meanwhile. Empty = off (machines are registered by hand). The group is
+/// created when it is new.
+async fn set_new_machines(
+    State(st): State<SharedState>,
+    axum::Extension(w): axum::Extension<crate::auth::Who>,
+    Json(b): Json<NewMachinesBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let g = b.group.as_deref().map(str::trim).unwrap_or("");
+    if let Some(cur) = crate::machines::new_group(&st)
+        && !same(&cur, g)
+    {
+        waiting_none(&st, &cur)?;
+    }
+    if g.is_empty() {
+        st.db
+            .set_config(crate::machines::NEW_GROUP_KEY, "")
+            .map_err(ise)?;
+        tracing::info!("{}: new machines are registered by hand again", w.name);
+        return Ok(ok());
+    }
+    let name = name_ok(g)?;
+    // One spelling: an existing group keeps its own.
+    let name = all(&st)
+        .into_iter()
+        .find(|x| same(x, &name))
+        .unwrap_or(name);
+    edit_names(&st, "groups", |v| {
+        if !v.iter().any(|x| same(x, &name)) {
+            v.push(name.clone());
+        }
+    })?;
+    st.db
+        .set_config(crate::machines::NEW_GROUP_KEY, &name)
+        .map_err(ise)?;
+    tracing::warn!(
+        "{}: unknown PCs that network-boot now join group {name} by themselves",
+        w.name
+    );
+    Ok(ok())
+}
+
+/// Machines waiting in the new-machines group `cur` are never let out of it by changing or deleting the setting: they
+/// would become ordinary machines (no group, or still in `cur`) whose disks may be partitioned without asking. The
+/// admin moves them (Devices / Groups page) or deletes them first.
+fn waiting_none(st: &SharedState, cur: &str) -> Result<(), ApiError> {
+    let n = st
+        .db
+        .machines()
+        .map_err(ise)?
+        .iter()
+        .filter(|m| crate::machines::waiting(m, Some(cur)))
+        .count();
+    if n > 0 {
+        return Err(bad(format!(
+            "{n} machine(s) still wait in group {cur}: move them to their groups (Devices / Groups page) or delete them first"
+        )));
+    }
+    Ok(())
+}
+
+/// The new-machines group renamed (`to`) or deleted (None → off).
+fn rename_new_machines(st: &SharedState, from: &str, to: Option<&str>) -> Result<(), ApiError> {
+    let cur = st.db.get_config(crate::machines::NEW_GROUP_KEY, "");
+    if !cur.is_empty() && same(&cur, from) {
+        st.db
+            .set_config(crate::machines::NEW_GROUP_KEY, to.unwrap_or(""))
+            .map_err(ise)?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -239,6 +357,8 @@ fn apply(
             st.db.set_machine_group(m.id, g.as_deref()).map_err(ise)?;
         }
     }
+    // Diskless goldens (no group = no machine: losing the last one is fine).
+    crate::diskless::edit_groups(st, &|name, g| f(&format!("g{name}"), g))?;
     Ok(())
 }
 
@@ -256,6 +376,16 @@ async fn rename(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let to = name_ok(&b.to)?;
     let from = b.from.trim().to_string();
+    // Merged into another group, the new-machines group would make that group's machines wait (and unknown PCs get
+    // that group's images and goldens): rename it to a new name only.
+    if crate::machines::new_group(&st).is_some_and(|c| same(&c, &from))
+        && !same(&from, &to)
+        && all(&st).iter().any(|g| same(g, &to))
+    {
+        return Err(bad(format!(
+            "group {from} is where new machines wait: it can't be merged into {to}"
+        )));
+    }
     let st2 = st.clone();
     let (f2, t2) = (from.clone(), to.clone());
     tokio::task::spawn_blocking(move || {
@@ -279,12 +409,16 @@ async fn rename(
 }
 
 /// POST /api/groups/delete {name} — its machines get no group; it leaves every image / games disk / driver. Refused
-/// while an image or games disk is only for this group (it would go to every machine).
+/// while an image or games disk is only for this group (it would go to every machine), and while machines wait in it
+/// when it is the new-machines group.
 async fn delete(
     State(st): State<SharedState>,
     Json(b): Json<NameBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let name = b.name.trim().to_string();
+    if crate::machines::new_group(&st).is_some_and(|c| same(&c, &name)) {
+        waiting_none(&st, &name)?;
+    }
     let (st2, n2) = (st.clone(), name.clone());
     tokio::task::spawn_blocking(move || {
         apply(
@@ -322,6 +456,13 @@ struct SetBody {
     /// Its machines hide their other disks from the guest (disks.rs); None = unchanged.
     #[serde(default)]
     hide_disks: Option<bool>,
+    /// Diskless golden names its machines boot; None = unchanged (a client that doesn't know them).
+    #[serde(default)]
+    goldens: Option<Vec<String>>,
+    /// The version it gets of a golden ("g<name>") / iSCSI disk ("d<name>"): a number holds it there, null = the
+    /// newest (pins.rs). Ones not listed are unchanged.
+    #[serde(default)]
+    versions: Option<std::collections::BTreeMap<String, Option<u64>>>,
 }
 
 /// POST /api/groups/set {name, machines, images, disks, drivers, allow_all} — exactly these are the group's. Images /
@@ -340,12 +481,17 @@ async fn set(
             _ => false,
         };
         let f = |key: &str, g: &[String]| {
-            // Image / games disk for every machine: stays so (not made this group's only).
-            if g.is_empty() && !key.starts_with('r') {
+            // Image / games disk for every machine: stays so (not made this group's only). A golden with no group has
+            // no machine: it simply gets this one.
+            if g.is_empty() && !key.starts_with('r') && !key.starts_with('g') {
                 return Vec::new();
             }
             let has = g.iter().any(|x| same(x, &n2));
-            match (want(key), has) {
+            let want = match key.split_at(1) {
+                ("g", n) => b.goldens.as_ref().map_or(has, |l| l.iter().any(|x| x == n)),
+                _ => want(key),
+            };
+            match (want, has) {
                 (true, false) => g.iter().cloned().chain([n2.clone()]).collect(),
                 (false, true) => swap(g, &n2, None),
                 _ => g.to_vec(),
@@ -371,7 +517,29 @@ async fn set(
             if !v.iter().any(|g| same(g, &n2)) {
                 v.push(n2.clone());
             }
-        })
+        })?;
+        crate::pins::prune(&st2)?; // versions held for goldens / disks the group no longer gets
+        for (k, ver) in b.versions.iter().flatten() {
+            let (golden, disk) = match k.split_at(k.len().min(1)) {
+                ("g", n) => (true, n),
+                ("d", n) => (false, n),
+                _ => continue,
+            };
+            let gets = if golden {
+                crate::diskless::goldens(&st2)
+                    .iter()
+                    .any(|g| g.name == disk && g.groups.iter().any(|x| same(x, &n2)))
+            } else {
+                crate::games::disks(&st2).iter().any(|d| {
+                    d.name == disk && (d.groups.is_empty() || d.groups.iter().any(|x| same(x, &n2)))
+                })
+            };
+            if gets {
+                let m = crate::pins::set(&st2, golden, disk, &n2, *ver)?;
+                tracing::info!("versions: {m}");
+            }
+        }
+        Ok(())
     })
     .await
     .map_err(ise)??;
@@ -382,7 +550,12 @@ async fn set(
 
 async fn sync_games(st: &SharedState) {
     let st = st.clone();
-    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || crate::games::sync(&st)).await {
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || {
+        let _ = crate::diskless::sync(&st); // logs its own errors
+        crate::games::sync(&st)
+    })
+    .await
+    {
         tracing::warn!("iSCSI disks: {e}");
     }
 }

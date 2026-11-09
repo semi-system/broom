@@ -121,6 +121,29 @@ public static class BroomVnc {
     } catch { }
   }
 
+  // Power (power.rs on the server, a signed command): restart / shutdown after `delay` seconds with `msg` on screen -
+  // Windows' own shutdown.exe, which shows the countdown to whoever is signed in - or cancel a pending one. We are
+  // SYSTEM: allowed. The server cleaned the message (no quotes); cleaned here again.
+  static void Power(string what, int delay, string msg) {
+    try {
+      string args;
+      if (what == "cancel") args = "/a";
+      else if (what == "restart" || what == "shutdown") {
+        delay = Clamp(delay, 0, 600);
+        args = (what == "restart" ? "/r" : "/s") + " /f /t " + delay;
+        string m = (msg ?? "").Replace("\"", "").Replace("\\", "").Replace("\r", " ").Replace("\n", " ").Trim();
+        if (m.Length > 200) m = m.Substring(0, 200);
+        if (m.Length > 0) args += " /c \"" + m + "\"";
+      } else { Log("power: unknown action " + what); return; }
+      string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "shutdown.exe");
+      var psi = new System.Diagnostics.ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = true };
+      using (var p = System.Diagnostics.Process.Start(psi)) {
+        p.WaitForExit(10000);
+        Log("power: " + what + " (shutdown " + args + ") -> exit " + (p.HasExited ? p.ExitCode.ToString() : "still running"));
+      }
+    } catch (Exception e) { Log("power: " + what + " failed: " + e.Message); }
+  }
+
   [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool LookupPrivilegeValueW(string system, string name, out long luid);
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPriv tp, uint len, IntPtr prev, IntPtr retLen);
   [StructLayout(LayoutKind.Sequential, Pack = 4)] struct TokenPriv { public uint Count; public long Luid; public uint Attr; }
@@ -205,10 +228,15 @@ public static class BroomVnc {
           if (!sent) { frameReady.Release(); await Task.Delay(50); } // nothing changed: free the slot, look again soon
         }
       });
-      // Hardware health pushed over this same connection (metrics.rs), whether or not anyone is watching.
+      // Hardware health pushed over this same connection (metrics.rs), whether or not anyone is watching; the hardware
+      // list (inventory.rs) now, again after 2 minutes (the games disks are mounted by then: broom-games.ps1 runs at
+      // start too) and every 30 minutes.
       var health = Task.Run(async () => {
+        int n = 0;
         while (ws.State == WebSocketState.Open) {
           try { string j = BuildMetrics(); if (j != null) await SendText(ws, sendLock, j); } catch { }
+          if (n % 120 == 0 || n == 8) { try { await SendText(ws, sendLock, BuildInventory()); } catch { } }
+          n++;
           await Task.Delay(15000);
         }
       });
@@ -234,6 +262,12 @@ public static class BroomVnc {
         else if (op == "key") { Key(Field(text, "code"), text.Contains("\"down\":true")); }
         else if (op == "sas") { try { SendSAS(false); } catch { } } // Ctrl+Alt+Del (we are SYSTEM; policy set in broom-done)
         else if (op == "clip") { SetClip(ReadString(text, "text")); }
+        else if (op == "power") { Power(Field(text, "do"), IntField(text, "delay", 30), ReadString(text, "msg")); }
+        else if (op == "display") {
+          if (SetDisplay(IntField(text, "w", 0), IntField(text, "h", 0), IntField(text, "hz", 0))) {
+            try { await SendText(ws, sendLock, BuildInventory()); } catch { }   // the server sees the new mode now
+          }
+        }
       }
       streaming = false;
       cts.Cancel();
@@ -810,6 +844,156 @@ public static class BroomVnc {
 
   [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
   static extern bool GetDiskFreeSpaceExW(string dir, out ulong avail, out ulong total, out ulong free);
+
+  // ---- hardware list (inventory.rs on the server) ----
+  // What the machine is made of, sent once a connection is up and every 30 minutes: Windows, board + BIOS, CPU, RAM
+  // sticks, graphics cards + driver, disks, network cards + link speed, monitors and the display modes each output
+  // offers (the server's per-machine resolution / refresh pick comes from these). Best-effort like the metrics.
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  struct DISPLAY_DEVICE {
+    public int cb;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+    public int StateFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+  }
+  // DEVMODEW, display variant (220 bytes).
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  struct DEVMODE {
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+    public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+    public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+    public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+    public short dmLogPixels;
+    public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+    public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+  }
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevicesW(string dev, uint n, ref DISPLAY_DEVICE dd, uint flags);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettingsW(string dev, int mode, ref DEVMODE dm);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int ChangeDisplaySettingsExW(string dev, ref DEVMODE dm, IntPtr hwnd, uint flags, IntPtr param);
+
+  // The outputs attached to the desktop: (device name like \\.\DISPLAY1, adapter, primary).
+  static List<Tuple<string, string, bool>> Outputs() {
+    var r = new List<Tuple<string, string, bool>>();
+    for (uint i = 0; i < 16; i++) {
+      var dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+      if (!EnumDisplayDevicesW(null, i, ref dd, 0)) break;
+      if ((dd.StateFlags & 1) == 0) continue; // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
+      r.Add(Tuple.Create(dd.DeviceName, dd.DeviceString, (dd.StateFlags & 4) != 0));
+    }
+    return r;
+  }
+
+  static DEVMODE NewMode() { var m = new DEVMODE(); m.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE)); return m; }
+
+  static string Str(object o) { return JsonEsc(Convert.ToString(o ?? "").Trim()); }
+  static string Num(object o) { try { return Convert.ToUInt64(o).ToString(); } catch { return "0"; } }
+  // A WMI string made of UInt16 characters (WmiMonitorID).
+  static string U16(object o) {
+    var a = o as ushort[]; if (a == null) return "";
+    var b = new System.Text.StringBuilder();
+    foreach (var c in a) { if (c == 0) break; b.Append((char)c); }
+    return b.ToString().Trim();
+  }
+  // Rows of one WMI query as JSON objects, each field via `f` (null = skip the row).
+  static string Rows(string ns, string wql, Func<ManagementBaseObject, string> f) {
+    var parts = new List<string>();
+    try { foreach (var o in Query(ns, wql)) { var s = f(o); if (s != null) parts.Add(s); } } catch { }
+    return "[" + string.Join(",", parts.ToArray()) + "]";
+  }
+
+  // Display (display.rs, op "display"): the main output to w x h at hz - only a mode it offers, tested first, kept for
+  // every user (CDS_UPDATEREGISTRY | CDS_GLOBAL). Already so: nothing. true = changed.
+  static bool SetDisplay(int w, int h, int hz) {
+    try {
+      var outs = Outputs();
+      if (outs.Count == 0 || w <= 0 || h <= 0 || hz <= 0) return false;
+      var o = outs.Find(x => x.Item3) ?? outs[0];
+      var cur = NewMode();
+      if (EnumDisplaySettingsW(o.Item1, -1, ref cur) && cur.dmPelsWidth == w && cur.dmPelsHeight == h && cur.dmDisplayFrequency == hz) return false;
+      bool offered = false;
+      for (int i = 0; i < 2000 && !offered; i++) {
+        var m = NewMode();
+        if (!EnumDisplaySettingsW(o.Item1, i, ref m)) break;
+        offered = m.dmPelsWidth == w && m.dmPelsHeight == h && m.dmDisplayFrequency == hz;
+      }
+      if (!offered) { Log("display: " + w + "x" + h + "@" + hz + " is not offered by " + o.Item1 + " (" + o.Item2 + ")"); return false; }
+      var dm = NewMode();
+      dm.dmPelsWidth = w; dm.dmPelsHeight = h; dm.dmDisplayFrequency = hz;
+      dm.dmFields = 0x80000 | 0x100000 | 0x400000; // DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY
+      int t = ChangeDisplaySettingsExW(o.Item1, ref dm, IntPtr.Zero, 0x2, IntPtr.Zero); // CDS_TEST
+      if (t != 0) { Log("display: " + w + "x" + h + "@" + hz + " refused by the driver (" + t + ")"); return false; }
+      int r = ChangeDisplaySettingsExW(o.Item1, ref dm, IntPtr.Zero, 0x1 | 0x8, IntPtr.Zero); // CDS_UPDATEREGISTRY | CDS_GLOBAL
+      Log("display: " + o.Item1 + " -> " + w + "x" + h + "@" + hz + " (result " + r + ")");
+      return r == 0 || r == 1; // DISP_CHANGE_SUCCESSFUL / RESTART
+    } catch (Exception e) { Log("display: " + e.Message); return false; }
+  }
+
+  static string BuildInventory() {
+    var sb = new System.Text.StringBuilder("{\"t\":\"inventory\"");
+    try {
+      foreach (var o in Query(null, "SELECT Caption,Version,BuildNumber FROM Win32_OperatingSystem")) {
+        sb.Append(",\"os\":\"").Append(Str(o["Caption"])).Append("\",\"build\":\"").Append(Str(o["Version"])).Append('"'); break;
+      }
+    } catch { }
+    try {
+      foreach (var o in Query(null, "SELECT Manufacturer,Model,TotalPhysicalMemory FROM Win32_ComputerSystem")) {
+        sb.Append(",\"maker\":\"").Append(Str(o["Manufacturer"])).Append("\",\"model\":\"").Append(Str(o["Model"]))
+          .Append("\",\"ram_total\":").Append(Num(o["TotalPhysicalMemory"])); break;
+      }
+    } catch { }
+    try {
+      foreach (var o in Query(null, "SELECT Manufacturer,Product FROM Win32_BaseBoard")) {
+        sb.Append(",\"board\":\"").Append(Str(o["Manufacturer"])).Append(' ').Append(Str(o["Product"])).Append('"'); break;
+      }
+    } catch { }
+    try {
+      foreach (var o in Query(null, "SELECT Manufacturer,SMBIOSBIOSVersion,ReleaseDate FROM Win32_BIOS")) {
+        string d = Convert.ToString(o["ReleaseDate"] ?? "");
+        sb.Append(",\"bios\":\"").Append(Str(o["Manufacturer"])).Append(' ').Append(Str(o["SMBIOSBIOSVersion"]))
+          .Append(d.Length >= 8 ? " (" + d.Substring(0, 4) + "-" + d.Substring(4, 2) + "-" + d.Substring(6, 2) + ")" : "").Append('"'); break;
+      }
+    } catch { }
+    sb.Append(",\"cpus\":").Append(Rows(null, "SELECT Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed FROM Win32_Processor", o =>
+      "{\"name\":\"" + Str(o["Name"]) + "\",\"cores\":" + Num(o["NumberOfCores"]) + ",\"threads\":" + Num(o["NumberOfLogicalProcessors"]) + ",\"mhz\":" + Num(o["MaxClockSpeed"]) + "}"));
+    sb.Append(",\"ram\":").Append(Rows(null, "SELECT DeviceLocator,Capacity,Speed,ConfiguredClockSpeed,Manufacturer,PartNumber FROM Win32_PhysicalMemory", o =>
+      "{\"slot\":\"" + Str(o["DeviceLocator"]) + "\",\"size\":" + Num(o["Capacity"]) + ",\"speed\":" + Num(o["ConfiguredClockSpeed"] ?? o["Speed"]) + ",\"maker\":\"" + Str(o["Manufacturer"]) + "\",\"part\":\"" + Str(o["PartNumber"]) + "\"}"));
+    sb.Append(",\"gpus\":").Append(Rows(null, "SELECT Name,DriverVersion,CurrentHorizontalResolution,CurrentVerticalResolution,CurrentRefreshRate FROM Win32_VideoController", o =>
+      "{\"name\":\"" + Str(o["Name"]) + "\",\"driver\":\"" + Str(o["DriverVersion"]) + "\",\"w\":" + Num(o["CurrentHorizontalResolution"]) + ",\"h\":" + Num(o["CurrentVerticalResolution"]) + ",\"hz\":" + Num(o["CurrentRefreshRate"]) + "}"));
+    sb.Append(",\"drives\":").Append(Rows(null, "SELECT Model,Size,InterfaceType FROM Win32_DiskDrive", o =>
+      "{\"model\":\"" + Str(o["Model"]) + "\",\"size\":" + Num(o["Size"]) + ",\"bus\":\"" + Str(o["InterfaceType"]) + "\"}"));
+    sb.Append(",\"nics\":").Append(Rows(null, "SELECT Name,MACAddress,Speed,NetConnectionStatus FROM Win32_NetworkAdapter WHERE PhysicalAdapter=TRUE", o =>
+      "{\"name\":\"" + Str(o["Name"]) + "\",\"mac\":\"" + Str(o["MACAddress"]) + "\",\"speed\":" + Num(o["Speed"]) + ",\"up\":" + (Convert.ToString(o["NetConnectionStatus"]) == "2" ? "true" : "false") + "}"));
+    sb.Append(",\"monitors\":").Append(Rows(@"root\wmi", "SELECT ManufacturerName,UserFriendlyName FROM WmiMonitorID", o => {
+      string n = U16(o["UserFriendlyName"]), m = U16(o["ManufacturerName"]);
+      return (n + m).Length == 0 ? null : "{\"name\":\"" + JsonEsc(n) + "\",\"maker\":\"" + JsonEsc(m) + "\"}";
+    }));
+    // Each output: its current mode and every mode it offers (32-bit colour; each size + refresh once).
+    var outs = new List<string>();
+    try {
+      foreach (var o in Outputs()) {
+        var cur = NewMode();
+        if (!EnumDisplaySettingsW(o.Item1, -1, ref cur)) continue; // ENUM_CURRENT_SETTINGS
+        var seen = new HashSet<string>(); var modes = new List<int[]>();
+        for (int i = 0; i < 2000; i++) {
+          var m = NewMode();
+          if (!EnumDisplaySettingsW(o.Item1, i, ref m)) break;
+          if (m.dmBitsPerPel != 32) continue;
+          string k = m.dmPelsWidth + "x" + m.dmPelsHeight + "@" + m.dmDisplayFrequency;
+          if (seen.Add(k)) modes.Add(new[] { m.dmPelsWidth, m.dmPelsHeight, m.dmDisplayFrequency });
+        }
+        modes.Sort((a, b) => a[0] != b[0] ? b[0] - a[0] : a[1] != b[1] ? b[1] - a[1] : b[2] - a[2]);
+        var ms = new List<string>();
+        foreach (var m in modes) { if (ms.Count >= 200) break; ms.Add("[" + m[0] + "," + m[1] + "," + m[2] + "]"); }
+        outs.Add("{\"device\":\"" + JsonEsc(o.Item1) + "\",\"adapter\":\"" + JsonEsc(o.Item2) + "\",\"primary\":" + (o.Item3 ? "true" : "false") +
+          ",\"w\":" + cur.dmPelsWidth + ",\"h\":" + cur.dmPelsHeight + ",\"hz\":" + cur.dmDisplayFrequency + ",\"modes\":[" + string.Join(",", ms.ToArray()) + "]}");
+      }
+    } catch { }
+    sb.Append(",\"displays\":[").Append(string.Join(",", outs.ToArray())).Append("]}");
+    return sb.ToString();
+  }
 
   // KeyboardEvent.code -> PS/2 set 1 scancode (0xE000 marks an extended key). Enough for a keyboard; unknown -> 0.
   static int Scancode(string c) {

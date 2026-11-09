@@ -220,3 +220,135 @@ fn fuzz_cdbs() {
         }
     });
 }
+
+/// An installer ISO as a DVD-ROM: CD/DVD device type, 2048-byte blocks, reads in those blocks, the table of contents
+/// (track 1 + lead-out, LBA and MSF), session info, DVD-ROM profile, media present, read-only.
+#[test]
+fn iso_as_dvd_rom() {
+    let size = 6_000_000 * 2048 + 10; // a last partial sector is still readable (rounded up)
+    let h = |b: &[u8]| handle_cd(&cdb(b), size, "iqn.x:iso");
+    let Cmd::Data(d) = h(&[0x12, 0, 0, 0, 96]) else {
+        panic!()
+    };
+    assert_eq!(
+        (d[0], d[1] & 0x80, &d[8..13]),
+        (0x05, 0x80, &b"BROOM"[..]),
+        "CD/DVD, removable"
+    );
+    assert_eq!(
+        h(&[0x25]),
+        Cmd::Data(vec![0, 0x5b, 0x8d, 0x80, 0, 0, 8, 0]),
+        "last LBA 6000000, 2048"
+    );
+    assert_eq!(
+        h(&[0x28, 0, 0, 0, 0, 16, 0, 0, 1]),
+        Cmd::Read { lba: 16, blocks: 1 }
+    );
+    assert_eq!(
+        h(&[0xa8, 0, 0, 0x5b, 0x8d, 0x80, 0, 0, 0, 1]),
+        Cmd::Read {
+            lba: 6_000_000,
+            blocks: 1
+        },
+        "the rounded-up last sector"
+    );
+    assert_eq!(
+        h(&[0x28, 0, 0, 0x5b, 0x8d, 0x81, 0, 0, 1]),
+        Cmd::Check(0x05, 0x21, 0),
+        "past the end"
+    );
+    assert_eq!(
+        h(&[0x28, 0, 0, 0, 0, 0, 0, 0x02, 0x01]),
+        Cmd::Check(0x05, 0x24, 0),
+        "over 1 MB"
+    );
+    // TOC, LBA form: header, track 1 at 0, lead-out at the end.
+    let Cmd::Data(t) = h(&[0x43, 0, 0, 0, 0, 0, 0, 0x03, 0x24]) else {
+        panic!()
+    };
+    assert_eq!(&t[..4], &[0, 18, 1, 1]);
+    assert_eq!(&t[4..12], &[0, 0x14, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(&t[12..20], &[0, 0x14, 0xaa, 0, 0, 0x5b, 0x8d, 0x81]);
+    // MSF form: track 1 at 00:02:00.
+    let Cmd::Data(t) = h(&[0x43, 0x02, 0, 0, 0, 0, 0, 0x03, 0x24]) else {
+        panic!()
+    };
+    assert_eq!(&t[8..12], &[0, 0, 2, 0]);
+    // Session info.
+    let Cmd::Data(t) = h(&[0x43, 0, 1, 0, 0, 0, 0, 0, 12]) else {
+        panic!()
+    };
+    assert_eq!(t, [0, 10, 1, 1, 0, 0x14, 1, 0, 0, 0, 0, 0]);
+    // Allocation length cuts the answer.
+    let Cmd::Data(t) = h(&[0x43, 0, 0, 0, 0, 0, 0, 0, 4]) else {
+        panic!()
+    };
+    assert_eq!(t.len(), 4);
+    // GET CONFIGURATION: current profile DVD-ROM; the profile list feature first.
+    let Cmd::Data(c) = h(&[0x46, 0, 0, 0, 0, 0, 0, 0x01, 0]) else {
+        panic!()
+    };
+    assert_eq!(be(&c[6..8]), 0x0010);
+    assert_eq!(be(&c[..4]) as usize, c.len() - 4);
+    assert_eq!(&c[8..10], &[0, 0], "profile list");
+    // One feature only (RT=2).
+    let Cmd::Data(c) = h(&[0x46, 2, 0, 0x10, 0, 0, 0, 0x01, 0]) else {
+        panic!()
+    };
+    assert_eq!(
+        (c.len(), &c[8..10]),
+        (8 + 12, &[0u8, 0x10][..]),
+        "random readable"
+    );
+    // Media event: present, no change. Asynchronous form refused.
+    assert_eq!(
+        h(&[0x4a, 1, 0, 0, 0x10, 0, 0, 0, 8]),
+        Cmd::Data(vec![0, 6, 4, 0x10, 0, 2, 0, 0])
+    );
+    assert_eq!(
+        h(&[0x4a, 0, 0, 0, 0x10, 0, 0, 0, 8]),
+        Cmd::Check(0x05, 0x24, 0)
+    );
+    // Capabilities page; other pages refused.
+    let Cmd::Data(m) = h(&[0x5a, 0, 0x2a, 0, 0, 0, 0, 0, 0xff]) else {
+        panic!()
+    };
+    assert_eq!((m[8], m[9]), (0x2a, 20));
+    assert_eq!(
+        h(&[0x5a, 0, 0x08, 0, 0, 0, 0, 0, 0xff]),
+        Cmd::Check(0x05, 0x24, 0)
+    );
+    // Read-only; no CSS.
+    assert_eq!(
+        h(&[0x2a, 0, 0, 0, 0, 0, 0, 0, 1]),
+        Cmd::Check(0x07, 0x27, 0)
+    );
+    assert_eq!(
+        h(&[0xad, 0, 0, 0, 0, 0, 0, 1, 0, 8]),
+        Cmd::Data(vec![0, 6, 0, 0, 0, 0, 0, 0])
+    );
+    assert_eq!(h(&[0x00]), Cmd::Ok);
+    assert_eq!(h(&[0x99]), Cmd::Check(0x05, 0x20, 0));
+}
+
+/// Random CDBs from the LAN never panic the DVD-ROM handler, and reads stay within the disc.
+#[test]
+fn fuzz_cd_cdbs() {
+    let size = 3 * 2048 + 7;
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 0..200_000u32 {
+        let mut c = [0u8; 16];
+        for b in c.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        c[0] = [
+            0x12, 0x25, 0x28, 0xa8, 0xbe, 0x43, 0x46, 0x4a, 0x51, 0x5a, 0x1a, 0xad, 0xbd,
+        ][i as usize % 13];
+        if let Cmd::Read { lba, blocks } = handle_cd(&c, size, "t") {
+            assert!(lba + blocks as u64 <= 4, "{c:x?}");
+        }
+    }
+}

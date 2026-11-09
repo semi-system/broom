@@ -26,7 +26,7 @@ for(const ev of ['click','change','input'])document.addEventListener(ev,e=>{
 });
 
 // ---- tabs: load HTML fragments on demand (/ui/<page>) + only load data for the tab being viewed ----
-const loaders={machines:loadStatus,remote:loadRemote,server:loadServer,devices:loadDevices,groups:loadGroups,images:loadImages,games:loadGames,drivers:loadDrivers,network:loadDhcp,windows:loadCafe,system:()=>{loadCafe();loadUsers();},benchmark:loadBench,logs:loadLogs};
+const loaders={machines:loadStatus,remote:loadRemote,server:loadServer,devices:loadDevices,groups:loadGroups,images:loadImages,games:loadGames,diskless:loadDiskless,drivers:loadDrivers,network:loadDhcp,windows:loadCafe,system:()=>{loadCafe();loadUsers();loadTls();},benchmark:loadBench,logs:loadLogs};
 const fragCache={};
 let curPage=null;
 async function showPage(p){
@@ -98,22 +98,93 @@ function renderMachines(){
   const page=rows.slice((mPage-1)*M_PAGE,mPage*M_PAGE);
   document.querySelector('#machines tbody').innerHTML=page.map(m=>
     `<tr>
+       <td>${m.registered&&m.id!=null?`<input type="checkbox" class="form-check-input" data-change="mSelOne" data-args="${esc(JSON.stringify([m.id]))}"${mSel.has(m.id)?' checked':''} aria-label="select">`:''}</td>
        <td>${m.hostname?esc(m.hostname):'<span class="mono">—</span>'} ${m.registered?'':'<span class="badge rounded-pill text-bg-warning">new</span>'}</td>
        <td class="mono">${m.grp?esc(m.grp):'—'}</td>
        <td class="mono">${esc(m.ip)}</td><td class="mono">${esc(m.mac)}</td>
-       <td>${led(m.online)}${m.not_reset?' <span class="badge text-bg-danger" title="Windows started from the SSD without a PXE boot at '+new Date(m.not_reset*1000).toLocaleString()+' — this session was NOT reset (cable out, server down, boot order changed?). Cleared by the next PXE boot.">not reset</span>':''}${m.ssd_low?' <span class="badge text-bg-danger" title="SSD almost full during the session: '+gbs(m.ssd_low[0])+' free at '+new Date(m.ssd_low[1]*1000).toLocaleString()+' (the guest wrote a lot; Windows → SSD room). Cleared by the next PXE boot.">SSD full</span>':''}${mxBadge(m.metrics)}${upBadge(m)}${baseBadge(m)}</td>
+       <td>${led(m.online)}${m.not_reset?' <span class="badge text-bg-danger" title="Windows started from the SSD without a PXE boot at '+new Date(m.not_reset*1000).toLocaleString()+' — this session was NOT reset (cable out, server down, boot order changed?). Cleared by the next PXE boot.">not reset</span>':''}${m.ssd_low?' <span class="badge text-bg-danger" title="SSD almost full during the session: '+gbs(m.ssd_low[0])+' free at '+new Date(m.ssd_low[1]*1000).toLocaleString()+' (the guest wrote a lot; Windows → SSD room). Cleared by the next PXE boot.">SSD full</span>':''}${pwBadge(m)}${mxBadge(m.metrics)}${upBadge(m)}${baseBadge(m)}</td>
        <td class="mono" title="${esc(m.license_result||'')}">${licCell(m)}</td>
        <td><div class="d-flex gap-1">${m.registered
           ? `<button class="btn btn-sm btn-outline-secondary" ${act('wake',m.mac)}>Wake</button>
              <button class="btn btn-sm btn-outline-secondary" ${act('manage',m.id)} data-owner>Manage</button>
              ${basePick(m)}
-             ${m.remote?`<button class="btn btn-sm btn-outline-primary" ${act('remoteTo',m.hostname)} title="See and control this machine">Remote</button>`:''}`
+             ${m.remote?`<button class="btn btn-sm btn-outline-primary" ${act('remoteTo',m.hostname)} title="See and control this machine">Remote</button>`:''}
+             <button class="btn btn-sm btn-outline-secondary" ${act('hwToggle',m.id)} title="What it is made of (sent by its Broom agent)">Hardware</button>`
           : `<button class="btn btn-sm btn-outline-primary" ${act('regMachine',m.mac,m.ip,m.hostname)} data-owner>Register</button>`}</div></td>
-     </tr>`).join('') || '<tr><td colspan=7 class="mono">no matching machines</td></tr>';
+     </tr>${hwOpen.has(m.id)?`<tr><td></td><td colspan="7">${hwHtml(hwData[m.id],m.id)}</td></tr>`:''}`).join('') || '<tr><td colspan=8 class="mono">no matching machines</td></tr>';
   document.getElementById('m_count').textContent=rows.length+' machines';
+  mSelCount();
   document.getElementById('m_page').textContent='Page '+mPage+'/'+pages;
   const ps=document.getElementById('m_psize');if(ps)ps.value=M_PAGE===Infinity?'0':String(M_PAGE);
 }
+// Hardware list (inventory.rs): opened under its row, fetched when opened.
+const hwOpen=new Set(),hwData={};
+async function hwToggle(id){
+  if(hwOpen.has(id)){hwOpen.delete(id);renderMachines();return;}
+  try{hwData[id]=await j('/api/machines/inventory?id='+encodeURIComponent(id));hwOpen.add(id);renderMachines();}
+  catch(e){toast(e.message,true)}}
+function hwHtml(r,id){
+  const v=r&&r.inventory,d=(r&&r.display)||{};
+  // Resolution + refresh (display.rs): its own setting, from the modes its monitor offers; "" = as its group / Windows.
+  const cur=d.own||'';
+  const modes=[...new Set([cur,...((r&&r.modes)||[])].filter(Boolean))];
+  const disp=`<div class="d-flex flex-wrap gap-2 align-items-center small mb-2"><span class="text-body-secondary">Display</span>
+    <select class="form-select form-select-sm w-auto" data-owner data-change="hwDisplay" data-args="${esc(JSON.stringify([id]))}">
+      <option value=""${cur?'':' selected'}>${esc(d.group?'as its group ('+d.group+')':'Windows\' choice')}</option>
+      ${modes.map(x=>`<option value="${esc(x)}"${x===cur?' selected':''}>${esc(x.replace('x','×').replace('@',' @ ')+' Hz')}</option>`).join('')}</select>
+    <span class="text-body-secondary">${esc(d.effective?'applied at each start: '+d.effective:'')}</span></div>`;
+  if(!v)return disp+'<span class="text-body-secondary small">No hardware list yet: its Broom agent sends one once it is connected (Remote).</span>';
+  const GB=b=>(b/2**30).toFixed(0)+' GB',row=(k,input)=>input?`<tr><th class="text-nowrap pe-3 fw-normal text-body-secondary">${esc(k)}</th><td>${input}</td></tr>`:'';
+  const list=(a,f)=>(a||[]).map(f).filter(Boolean).join('<br>');
+  return `<table class="table table-sm mb-1 small"><tbody>
+    ${row('Windows',esc([v.os,v.build].filter(Boolean).join(' ')))}
+    ${row('Computer',esc([v.maker,v.model].filter(Boolean).join(' ')))}
+    ${row('Board',esc(v.board||''))}${row('BIOS',esc(v.bios||''))}
+    ${row('CPU',list(v.cpus,c=>esc(`${c.name} — ${c.cores} cores / ${c.threads} threads`)))}
+    ${row('RAM',esc(v.ram_total?GB(v.ram_total):'')+(v.ram&&v.ram.length?'<br>'+list(v.ram,r=>esc(`${r.slot}: ${GB(r.size)} ${r.speed} MT/s ${r.maker} ${r.part}`)):''))}
+    ${row('Graphics',list(v.gpus,g=>esc(`${g.name} — driver ${g.driver}`)))}
+    ${row('Drives',list(v.drives,d=>esc(`${d.model} — ${GB(d.size)} (${d.bus})`)))}
+    ${row('Network',list(v.nics,n=>esc(`${n.name} — ${n.speed?(n.speed/1e6)+' Mb/s':'no link'}${n.up?'':' (down)'} ${n.mac||''}`)))}
+    ${row('Monitors',list(v.monitors,m=>esc(`${m.maker} ${m.name}`)))}
+    ${row('Displays',list(v.displays,d=>esc(`${d.device}${d.primary?' (main)':''}: ${d.w}×${d.h} @ ${d.hz} Hz — ${(d.modes||[]).length} modes offered`)))}
+    </tbody></table><div class="small text-body-secondary">reported ${esc(new Date(v.at*1000).toLocaleString())}</div>`.replace('<table',disp+'<table');}
+async function hwDisplay(id,el){
+  try{const r=await j('/api/machines/display',mk({ids:[id],mode:el.value}));toast(el.value?'Display '+el.value+(r.sent?' sent':' set: applied at its next start'):'Display setting removed');
+    hwData[id]=await j('/api/machines/inventory?id='+encodeURIComponent(id));renderMachines();}
+  catch(e){toast(e.message,true)}}
+// The same for the selected machines, or for a group (new machines of it too).
+async function mDisplay(to){
+  const out=document.getElementById('m_pres'),mode=document.getElementById('m_disp').value.trim();
+  const body=to==='grp'?{group:document.getElementById('m_dgrp').value.trim(),mode}:{ids:[...mSel],mode};
+  if(to==='sel'&&!body.ids.length){say(out,' ✗ select machines first (the boxes on the left)');return;}
+  try{const r=await j('/api/machines/display',mk(body));say(out,' ✓ display '+(mode||'setting removed')+' — sent to '+r.sent+' running machine(s), the others at their next start');}
+  catch(e){say(out,' ✗ '+e.message);}}
+// Power (power.rs): the selected machines (kept across refreshes and pages) → turn on / restart / shut down / cancel.
+const mSel=new Set();
+function mSelCount(){for(const id of [...mSel])if(!allMachines.some(m=>m.id===id))mSel.delete(id);
+  const e=document.getElementById('m_sel');if(e)e.textContent=mSel.size+' selected';}
+function mSelOne(id,el){el.checked?mSel.add(id):mSel.delete(id);mSelCount();}
+function mSelAll(el){for(const m of filteredMachines())if(m.registered&&m.id!=null){el.checked?mSel.add(m.id):mSel.delete(m.id);}renderMachines();}
+async function mPower(action){
+  const out=document.getElementById('m_pres'),ids=[...mSel];
+  if(!ids.length){say(out,' ✗ select machines first (the boxes on the left)');return;}
+  const delay=+document.getElementById('m_delay').value,msg=document.getElementById('m_pmsg').value;
+  const names=allMachines.filter(m=>mSel.has(m.id)).map(m=>m.hostname||m.mac);
+  const verb={on:'Turn on',restart:'Restart',shutdown:'Shut down',cancel:'Cancel the restart / shutdown of'}[action];
+  const when=(action==='restart'||action==='shutdown')?(delay?' in '+delay+' s':' now'):'';
+  if(action!=='on'&&!await sure(verb+' '+ids.length+' machine(s)'+when+'? '+names.slice(0,12).join(', ')+(names.length>12?' …':'')))return;
+  try{const r=await j('/api/power',mk({action,ids,delay,msg}));const bad=r.results.filter(x=>!x.ok);
+    say(out,(r.done?' ✓ ':' ✗ ')+r.done+' of '+r.results.length+(bad.length?' — not done: '+bad.map(x=>x.name+' ('+x.msg+')').join('; '):''));}
+  catch(e){say(out,' ✗ '+e.message);}
+  loadStatus();}
+// The last power action while it plays out, and "booting" (chose from its boot menu, not up yet).
+function pwBadge(m){let s='';
+  if(m.booting)s+=' <span class="badge text-bg-info" title="network-booted in the last 5 minutes, not up yet">booting</span>';
+  const p=m.power;if(p){const left=Math.ceil(p.at+p.delay-Date.now()/1000);
+    const w={on:'turn on sent',restart:'restart',shutdown:'shut down',cancel:'cancel sent'}[p.what]||p.what;
+    const t=(p.what==='restart'||p.what==='shutdown')?(left>0?' in '+left+' s':' sent'):'';
+    s+=` <span class="badge text-bg-warning" title="sent ${esc(new Date(p.at*1000).toLocaleString())}">${esc(w+t)}</span>`;}
+  return s;}
 // Base mode (per machine + one Windows image): that image boots its base itself, every change kept over its restarts;
 // off → the next boot saves it as the base and resets to it from then on.
 const BASE_TIP='Base mode: when this machine boots the chosen Windows image, everything done is KEPT, over as many restarts as needed (Windows Update, apps that restart). Turn it off when done: the next boot saves it as the base, and every boot after resets to that base.';
@@ -549,7 +620,7 @@ async function volRemove(id){if(!await sure('Stop using broom disk '+id+'? It is
 async function loadDrivers(){
   const rows=await j('/api/drivers');
   document.querySelector('#drivers tbody').innerHTML=rows.map(d=>
-    `<tr><td>${esc(d.name)}</td><td class="mono">${gbs(d.size)}</td>
+    `<tr><td>${esc(d.name)}${d.net?' <span class="badge text-bg-info" title="network-card driver: also goes to Windows PE and into a golden for Add hardware">network card</span>':''}</td><td class="mono">${gbs(d.size)}</td>
        <td class="mono" title="${esc(d.hwids.slice(0,40).join('\n'))}${d.hwids.length>40?'\n…':''}">${d.hwids.length}</td>
        <td class="mono" style="white-space:normal">${d.machines.length?esc(d.machines.join(', ')):'—'}</td>
        <td><input class="form-check-input" type="checkbox" id="drv_all_${d.id}" ${d.all_machines?'checked':''}></td>
@@ -625,7 +696,7 @@ async function applyDhcp(){const b={};['mode','iface','server_ip','subnet','netm
 
 // ---- games disks (Games page) ----
 let gmDisks=[];
-async function loadGames(){const [g]=await Promise.all([j('/api/games'),loadVols()]);const tb=document.querySelector('#games tbody');if(!tb)return;
+async function loadGames(){const [g]=await Promise.all([j('/api/games'),loadVols(),loadVersions()]);const tb=document.querySelector('#games tbody');if(!tb)return;
   gmDisks=g.disks;
   document.getElementById('gm_grouplist').innerHTML=g.groups.map(x=>`<option value="${esc(x)}">`).join('');
   const opts=sel=>'<option value="">— none —</option>'+g.machines.map(m=>
@@ -633,12 +704,12 @@ async function loadGames(){const [g]=await Promise.all([j('/api/games'),loadVols
   tb.innerHTML=g.disks.map(x=>{const d=x.disk,s=x.status;
     return `<tr><td>${esc(d.name)}</td><td class="mono">${esc(d.letter)}:</td><td class="mono">${d.size_gb} GB</td>
       <td>${d.groups.length?esc(d.groups.join(', ')):'<span class="mono">all</span>'}</td>
-      <td class="mono">${s?'g'+s.ver+(s.layers?` <span title="versions not merged into the disk yet (${gbs(s.layer_bytes)})">+${s.layers} ${s.merging?'merging…':'to merge'}</span>`:''):'<span class="text-danger">not served</span>'}</td>
+      <td class="mono text-nowrap">${s?verCell('games',d.name,s):'<span class="text-danger">not served</span>'}</td>
       <td class="mono">${s?s.sessions+(s.old_sessions?` <span title="still on an older version until they reboot">(${s.old_sessions} older)</span>`:''):''}</td>
       <td><select class="form-select form-select-sm d-inline-block w-auto" data-owner data-change="setGamesUpdate" data-args="${esc(JSON.stringify([d.name]))}">${opts(d.update)}</select>${d.update!=null&&!x.update_ip?' <span class="text-danger" title="no fixed IP or lease known">no IP</span>':''}${s&&s.update_connected?' <span class="text-success">'+ic('dot','')+' writable</span>':''}</td>
       <td class="mono">${s&&s.update_bytes?gbs(s.update_bytes)+` <button class="btn btn-sm btn-outline-primary" ${act('saveGamesUpdate',d.name)}>Save</button> <button class="btn btn-sm btn-outline-secondary" ${act('discardGamesUpdate',d.name)}>Discard</button>`:'—'}</td>
       <td>${volCell('games',d.name,x.volume)}</td>
-      <td data-owner><button class="btn btn-sm btn-outline-secondary" ${act('toggleGamesRam',d.name,!d.ram)} title="RAM: the disk is served from a copy in the server's RAM (loaded in the background; needs about as much free RAM as the data on it — games barely compress). Disk: read from its file (the page cache keeps what is read most).">${d.ram?(s&&s.ram?'Cache: RAM':(s&&s.ram_loading?'Cache: RAM (loading…)':'Cache: RAM (not loaded)')):'Cache: disk'}</button> <button class="btn btn-sm btn-outline-secondary" ${act('editGames',d.name)}>Edit</button> <button class="btn btn-sm btn-outline-danger" ${act('delGames',d.name)}>Delete</button></td></tr>`;}).join('')
+      <td data-owner><button class="btn btn-sm btn-outline-secondary" ${act('toggleGamesRam',d.name,!d.ram)} title="RAM: the disk is served from a copy in the server's RAM (loaded in the background; needs about as much free RAM as the data on it — games barely compress). Disk: read from its file (the page cache keeps what is read most).">${d.ram?(s&&s.ram?'Cache: RAM':(s&&s.ram_loading?'Cache: RAM (loading…)':'Cache: RAM (not loaded)')):'Cache: disk'}</button> <button class="btn btn-sm btn-outline-secondary" ${act('editGames',d.name)}>Edit</button> <button class="btn btn-sm btn-outline-danger" ${act('delGames',d.name)}>Delete</button></td></tr>`+verRow('games',d.name,10);}).join('')
     ||'<tr><td colspan="10" class="mono">no iSCSI disk yet</td></tr>';
   const m=document.getElementById('gm_msg');if(m&&g.error)say(m,' ✗ not served: '+g.error);}
 async function gamesCall(url,body,q){if(q&&!await sure(q))return;await post(url,body,'gm_msg',r=>r.status||'saved',loadGames);}
@@ -651,17 +722,205 @@ const delGames=name=>gamesCall('/api/games/delete',{name},'Delete iSCSI disk '+n
 function editGames(name){const d=gmDisks.find(x=>x.disk.name===name).disk;
   for(const [k,val] of [['gm_name',d.name],['gm_letter',d.letter],['gm_size',d.size_gb],['gm_groups',d.groups.join(', ')]])document.getElementById(k).value=val;}
 
+// ---- versions of goldens / iSCSI disks (pins.rs): kept until a drive runs short, a group held on one ----
+let verData=null;const verOpen=new Set();
+async function loadVersions(){verData=await j('/api/versions').catch(()=>verData);return verData;}
+const verEntry=(kind,name)=>verData&&(kind==='golden'?verData.goldens:verData.games).find(x=>x.name===name);
+const pinOf=(pins,g)=>{for(const [k,x] of Object.entries(pins||{}))if(k.toLowerCase()===String(g).toLowerCase())return x;return null;};
+function verOpts(vers,cur){return `<option value=""${cur==null?' selected':''}>newest</option>`+[...vers].sort((a,b)=>b-a).map(x=>`<option value="${esc(x)}"${x===cur?' selected':''}>g${esc(x)}</option>`).join('');}
+// The Version column: the newest, how many are kept, the panel's button.
+function verCell(kind,name,s){const n=(s.versions&&s.versions.length)||(s.layers+1);
+  return `g${esc(s.ver)}${s.merging?' (merging…)':''} <button class="btn btn-sm btn-outline-secondary py-0" ${act('verToggle',kind,name)} title="versions kept, which one each group boots">${esc(n)} kept</button>`;}
+function verRow(kind,name,cols){return verOpen.has(kind+':'+name)?`<tr><td colspan="${esc(cols)}">${verPanel(kind,verEntry(kind,name))}</td></tr>`:'';}
+function verPanel(kind,e){if(!e)return '<span class="small text-body-secondary">no version information (not served, or the iSCSI daemon is of an older build)</span>';
+  const held=v=>Object.entries(e.pins||{}).filter(([,x])=>x===v).map(([k])=>k).join(', ');
+  const rows=[...(e.versions||[])].reverse().map(x=>`<tr><td class="mono">g${esc(x.ver)}${x.ver===e.newest?' <span class="badge text-bg-primary">newest</span>':''}</td>
+    <td class="mono">${esc(x.bytes?gbs(x.bytes):'(in the disk file)')}</td><td class="small">${esc(x.saved?new Date(x.saved*1000).toLocaleString():'')}</td>
+    <td class="small">${esc(x.sessions?x.sessions+' on it now':'')}</td><td class="small">${esc(held(x.ver))}</td></tr>`).join('');
+  const vers=(e.versions||[]).map(x=>x.ver);
+  const fs=e.fs_size?gbs(e.fs_free)+' free of '+gbs(e.fs_size)+' on its drive':'';
+  return `<div class="small mb-1 text-body-secondary">Every saved version is kept until its drive has less than ${esc(verData.min_free_pct)}% free; then the oldest goes — never one a group is held on or a machine is on now.${esc(fs?' '+fs+'.':'')}</div>
+    <div class="table-responsive"><table class="table table-sm w-auto mb-2"><thead><tr><th>Version</th><th>Its own data</th><th>Saved</th><th>In use</th><th>Held for</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="d-flex flex-wrap gap-3 align-items-center"><b class="small">Version each group boots</b>${verPicks(kind,e,vers)}
+    <button class="btn btn-sm btn-outline-danger" data-owner ${act('verDrop',kind,e.name)}>Drop the oldest version</button></div>`;}
+// A version picker per group that gets it: changing one holds that group there at once (machines: next boot).
+function verPicks(kind,e,vers){return (e.groups||[]).map(g=>`<label class="d-flex align-items-center gap-1 small">${esc(g)} <select class="form-select form-select-sm w-auto py-0" data-change="verPin" data-args="${esc(JSON.stringify([kind,e.name,g]))}">${verOpts(vers,pinOf(e.pins,g))}</select></label>`).join('')
+    ||'<span class="small text-body-secondary">for every machine — hold a group on a version from the Groups page</span>';}
+const verReload=kind=>kind==='golden'?loadDiskless():loadGames();
+async function verToggle(kind,name){const k=kind+':'+name;if(verOpen.has(k))verOpen.delete(k);else verOpen.add(k);verReload(kind);}
+async function verPin(kind,name,group,el){
+  try{const r=await j('/api/versions/pin',mk({kind,name,group,ver:el.value===''?null:+el.value}));toast(r.status);}catch(e){toast(e.message,true);}
+  verReload(kind);}
+async function verDrop(kind,name){if(!await sure('Drop the oldest kept version of '+name+' now? It can no longer be booted or gone back to. (Not possible while a machine is on it or a group is held on it.)'))return;
+  try{const r=await j('/api/versions/drop-oldest',mk({kind,name}));toast(r.status);}catch(e){toast(e.message,true);}
+  verReload(kind);}
+const verKeepFree=()=>post('/api/versions/keep-free',{pct:+v('ver_pct')},'ver_msg',()=>'saved',loadDiskless);
+
+// ---- diskless goldens (Diskless page) ----
+let dlData=null;
+const mac12=m=>(m||'').toLowerCase().replace(/[^0-9a-f]/g,'');
+async function loadDiskless(){
+  const [d,vl]=await Promise.all([j('/api/diskless'),j('/api/volumes').catch(()=>({volumes:[]})),loadVersions()]);
+  dlData=d;const tb=document.querySelector('#dl_goldens tbody');if(!tb)return;
+  const opts=sel=>'<option value="">— none —</option>'+d.machines.map(m=>
+    `<option value="${esc(m.id)}"${m.id===sel?' selected':''}>${esc(m.name)}${m.group?' ('+esc(m.group)+')':''}</option>`).join('');
+  tb.innerHTML=d.goldens.map(x=>{const g=x.golden,s=x.status?x.status.disk:null;
+    return `<tr><td><b>${esc(g.name)}</b></td><td>${osPill(g.os)}</td><td class="mono">${esc(g.size_gb)} GB</td>
+      <td><div class="mono small" style="max-width:16rem;white-space:normal;overflow-wrap:anywhere">${esc(g.iso||'—')}</div></td>
+      <td>${g.groups.length?esc(g.groups.join(', ')):'<span class="text-body-secondary">none</span>'}</td>
+      <td class="mono text-nowrap">${s?verCell('golden',g.name,s):'<span class="text-danger">not served</span>'}</td>
+      <td class="mono">${x.status?x.status.machines.filter(m=>m.connected).length:''}</td>
+      <td><select class="form-select form-select-sm d-inline-block w-auto" data-owner data-change="setMaint" data-args="${esc(JSON.stringify([g.name]))}">${opts(g.maint)}</select>${s&&s.update_connected?' <span class="text-success">'+ic('dot','')+' writable</span>':''}</td>
+      <td class="mono">${s&&s.update_bytes?gbs(s.update_bytes)+` <button class="btn btn-sm btn-outline-primary" data-owner ${act('saveMaint',g.name)}>Save</button> <button class="btn btn-sm btn-outline-secondary" data-owner ${act('discardMaint',g.name)}>Discard</button>`:'—'}</td>
+      <td data-owner class="text-nowrap"><button class="btn btn-sm btn-outline-secondary" ${act('editGolden',g.name)}>Edit</button>${g.os==='windows'?` <button class="btn btn-sm btn-outline-secondary" title="Write Broom's current startup script (broom-diskless.ps1) into this golden as its next version, without booting it. Needed once for goldens set up before the script updated itself." ${act('refreshGolden',g.name)}>Update script</button>`:''} <button class="btn btn-sm btn-outline-danger" ${act('delGolden',g.name)}>Delete</button></td></tr>`+verRow('golden',g.name,10);}).join('')
+    ||'<tr><td colspan="10" class="mono">no golden yet — create one below</td></tr>';
+  const vp=document.getElementById('ver_pct');if(vp&&verData&&document.activeElement!==vp)vp.value=verData.min_free_pct;
+  // Their machines: each with its own layers (from the daemon) and target.
+  const mb=document.querySelector('#dl_machines tbody');
+  const rows=d.goldens.flatMap(x=>x.machines.map(m=>{const st=x.status?x.status.machines.find(y=>y.mac===mac12(m.mac)):null;
+    return `<tr><td>${esc(x.golden.name)}</td><td>${esc(m.name)}</td><td class="mono">${esc(m.mac)}</td><td class="mono">${esc(m.ip)}</td>
+      <td class="mono">${st&&st.session_ver!=null?gbs(st.session_bytes)+' on g'+esc(st.session_ver):'—'}</td>
+      <td class="mono">${st&&st.base_ver!=null?gbs(st.base_bytes)+' (g'+esc(st.base_ver)+')':'—'}</td>
+      <td>${st&&st.connected?'<span class="text-success">'+ic('dot','')+' on</span>':'—'}</td>
+      <td class="mono small">${esc(m.target)}</td></tr>`;})).join('');
+  mb.innerHTML=rows||'<tr><td colspan="8" class="mono">no machine yet: put registered machines with a fixed IP in a golden\'s group</td></tr>';
+  const noip=d.goldens.filter(x=>x.machines_without_fixed_ip.length).map(x=>x.golden.name+': '+x.machines_without_fixed_ip.join(', ')+' (no fixed IP — not served)');
+  document.getElementById('dl_noip').textContent=noip.join(' · ');
+  const groups=[...new Set([...d.machines.map(m=>m.group).filter(Boolean),...d.goldens.flatMap(x=>x.golden.groups)])];
+  document.getElementById('dl_grouplist').innerHTML=groups.map(x=>`<option value="${esc(x)}">`).join('');
+  dlIsoOptions();
+  // ISO library.
+  const ib=document.querySelector('#dl_isos tbody');
+  ib.innerHTML=d.isos.map(i=>`<tr><td class="mono">${esc(i.name)}</td>
+      <td><select class="form-select form-select-sm d-inline-block w-auto" data-owner data-change="isoOs" data-args="${esc(JSON.stringify([i.name]))}"><option value="windows"${i.os==='windows'?' selected':''}>Windows</option><option value="linux"${i.os==='linux'?' selected':''}>Linux</option></select></td>
+      <td class="mono">${gbs(i.size)}</td><td class="mono">${i.added?new Date(i.added*1000).toLocaleString():''}</td>
+      <td data-owner><button class="btn btn-sm btn-outline-danger" ${act('delIso',i.name)}>Delete</button></td></tr>`).join('')
+    ||'<tr><td colspan="5" class="mono">no ISO yet — upload an installer below</td></tr>';
+  // Places: broom's own folder or a server disk each.
+  const labels={golden:'Goldens',writeback:'Machines\' layers (writeback)',iso:'ISO library'};
+  document.getElementById('dl_places').innerHTML=Object.keys(labels).map(k=>{const p=d.places[k]||{};
+    const opt='<option value="">broom\'s own folder</option>'+(vl.volumes||[]).map(v=>`<option value="${esc(v.id)}"${v.id===p.volume?' selected':''}>${esc(v.id)} — ${esc(v.path)}</option>`).join('');
+    return `<div class="d-flex flex-wrap gap-2 align-items-center"><span style="min-width:220px">${esc(labels[k])}</span>
+      <select class="form-select form-select-sm w-auto" id="dl_place_${esc(k)}">${opt}</select>
+      <button class="btn btn-sm btn-outline-primary" ${act('setPlace',k)}>Set</button>
+      <span class="mono small text-body-secondary">${esc(p.path||'')}</span></div>`;}).join('');
+  // The machines reach the server at its boot-LAN address, which may not be the one this page came from.
+  const srv=d.server||location.host;
+  const sc=document.getElementById('dl_scriptcmd');if(sc)sc.textContent='irm http://'+srv+'/broom-diskless.ps1 | iex';
+  const sh=document.getElementById('dl_scriptcmd_sh');if(sh)sh.textContent='curl -fsS http://'+srv+'/broom-diskless.sh | sudo sh';
+  const m=document.getElementById('dl_msg');if(m)say(m,d.error?' ✗ not served: '+d.error:'');
+  loadOnboard().catch(()=>{});loadVm().catch(()=>{});}
+// "Add hardware": a new PC's network card installed into a Windows golden (onboard.rs).
+let obTimer=null;
+async function loadOnboard(){
+  const o=await j('/api/onboard').catch(()=>null);if(!o||!dlData)return;
+  const gs=document.getElementById('ob_golden'),ms=document.getElementById('ob_machine');if(!gs)return;
+  const keepG=gs.value,keepM=ms.value;
+  gs.innerHTML=dlData.goldens.filter(x=>x.golden.os==='windows').map(x=>`<option value="${esc(x.golden.name)}"${x.golden.name===keepG?' selected':''}>${esc(x.golden.name)}</option>`).join('');
+  ms.innerHTML=dlData.machines.map(m=>`<option value="${esc(m.id)}"${String(m.id)===keepM?' selected':''}>${esc(m.name)}${m.group?' ('+esc(m.group)+')':''}</option>`).join('');
+  document.getElementById('ob_missing').textContent=o.missing?'Not possible on this server yet: '+o.missing:'';
+  const jb=o.job,box=document.getElementById('ob_job');
+  if(jb){const cls={done:'text-success',failed:'text-danger',cancelled:'text-body-secondary'}[jb.state]||'text-primary';
+    box.innerHTML=`<div><b>${esc(jb.golden)}</b> · <span class="${esc(cls)}">${esc(jb.state)}</span> · ${esc(jb.msg)}</div>`
+      +(jb.nics&&jb.nics.length?'<div class="small">'+jb.nics.map(n=>esc(n.name)+' <span class="mono">'+esc(n.instance)+'</span>').join('<br>')+'</div>':'')
+      +`<details class="small"><summary>Steps</summary><pre class="mono small mb-0" style="white-space:pre-wrap">${esc((jb.log||[]).join('\n'))}</pre></details>`;}
+  else box.innerHTML='';
+  if(jb&&jb.boot_card)box.innerHTML+=`<div class="small">Network card seen at network boot: <span class="mono">${esc(jb.boot_card)}</span></div>`;
+  if(o.hint)box.innerHTML+=`<div class="small text-warning-emphasis">${esc(o.hint)}</div>`;
+  const rows=Object.entries(o.hardware||{}).flatMap(([g,l])=>l.map(h=>`<tr><td>${esc(g)}</td><td>${esc(h.name)}</td><td class="mono small" style="overflow-wrap:anywhere">${esc(h.instance)}</td>
+    <td class="mono small">${esc(h.service)}${h.inf?' ('+esc(h.inf)+')':''}</td><td class="mono">g${esc(h.ver)}</td><td class="mono small">${h.added?new Date(h.added*1000).toLocaleString():''}</td></tr>`)).join('');
+  document.querySelector('#ob_hw tbody').innerHTML=rows||'<tr><td colspan="6" class="mono">none added yet</td></tr>';
+  // Follow a running job.
+  clearTimeout(obTimer);
+  if(jb&&(jb.state==='waiting'||jb.state==='installing')&&pageFromPath()==='diskless')obTimer=setTimeout(()=>loadOnboard().catch(()=>{}),4000);
+}
+// "Maintain in the browser" (vmmaint.rs): a Windows golden + games disks in a VM on the server, its screen at /vm-console.
+let vmTimer=null;
+async function loadVm(){
+  const r=await j('/api/vm').catch(()=>null);const box=document.getElementById('vm_box');if(!r||!box)return;
+  const s=r.session,run=s&&['starting','running','stopping'].includes(s.state);
+  const gs=document.getElementById('vm_golden'),keepG=gs.value;
+  gs.innerHTML=r.goldens.map(g=>`<option value="${esc(g.name)}"${g.name===keepG?' selected':''}>${esc(g.name)}</option>`).join('');
+  const was=new Set([...document.querySelectorAll('#vm_games input:checked')].map(i=>i.value));
+  document.getElementById('vm_games').innerHTML=r.games.filter(d=>d.served).map(d=>`<label class="form-check mb-0"><input class="form-check-input" type="checkbox" value="${esc(d.name)}"${was.has(d.name)?' checked':''}> ${esc(d.name)} <span class="mono">(${esc(d.letter)}:)</span></label>`).join('')||'<span class="text-body-secondary">none</span>';
+  document.getElementById('vm_form').style.display=run?'none':'';
+  document.getElementById('vm_problem').textContent=r.problem?'Not possible on this server yet: '+r.problem:'';
+  if(!s){box.innerHTML='';return;}
+  const cls={running:'text-success',failed:'text-danger',stopped:'text-body-secondary'}[s.state]||'text-primary';
+  const games=(s.games||[]).map(g=>g.name+' ('+g.letter+':)').join(', ');
+  let h=`<div><b>${esc(s.golden)}</b> · <span class="${esc(cls)}">${esc(s.state)}</span> · started ${esc(new Date(s.started*1000).toLocaleString())} by ${esc(s.by)}`
+    +(s.ended?' · ended '+esc(new Date(s.ended*1000).toLocaleString()):'')+`</div><div class="small">games disks: ${esc(games||'none')} · Windows changes ${s.keep?'kept for Save / Discard':'thrown away at the end'}</div>`;
+  if(s.msg&&!run)h+=`<div class="small">${esc(s.msg)}</div>`;
+  if(run)h+=`<div class="d-flex flex-wrap gap-2 mt-2"><a class="btn btn-sm btn-primary" href="/vm-console" target="_blank" rel="noopener">Open the screen</a>
+    <button class="btn btn-sm btn-outline-warning" ${act('vmStop',false)}>Shut down</button>
+    <button class="btn btn-sm btn-outline-danger" ${act('vmStop',true)} title="like pulling the plug — only if Windows hangs">Turn off</button></div>`;
+  else{const pend=r.games.filter(d=>(s.games||[]).some(g=>g.name===d.name)&&d.update_bytes>0);
+    if(pend.length)h+='<div class="d-flex flex-wrap gap-2 align-items-center mt-2 small">'+pend.map(d=>`<span><b>${esc(d.name)}</b>: ${gbs(d.update_bytes)} written</span>
+      <button class="btn btn-sm btn-outline-primary" ${act('vmGamesSave',d.name)}>Save</button>
+      <button class="btn btn-sm btn-outline-secondary" ${act('vmGamesDiscard',d.name)}>Discard</button>`).join(' ')+'</div>';}
+  box.innerHTML=h;
+  clearTimeout(vmTimer);
+  if(run&&pageFromPath()==='diskless')vmTimer=setTimeout(()=>loadVm().catch(()=>{}),5000);
+}
+function vmStart(){const games=[...document.querySelectorAll('#vm_games input:checked')].map(i=>i.value),keep=!!document.getElementById('vm_keep')?.checked;
+  post('/api/vm/start',{golden:v('vm_golden'),games,keep},'vm_msg',()=>'started — Open the screen',loadVm);}
+const vmStop=force=>sure(force?'Turn the VM off at once, like pulling the plug? Unsaved work in Windows is lost; use it only if Windows hangs.':'Press the VM\'s power button? Windows shuts down (close what you are doing first).').then(ok=>ok&&post('/api/vm/stop',{force},'vm_msg',r=>r.msg,loadVm));
+const vmGamesSave=name=>sure('Save the VM\'s changes to '+name+' as its new version? Each machine gets it at its next boot.').then(ok=>ok&&post('/api/games/save',{name},'vm_msg',r=>r.status||'saved',loadVm));
+const vmGamesDiscard=name=>sure('Throw the VM\'s changes to '+name+' away?').then(ok=>ok&&post('/api/games/discard',{name},'vm_msg',()=>'discarded',loadVm));
+const startOnboard=()=>post('/api/onboard/start',{golden:v('ob_golden'),machine:+v('ob_machine')},'ob_msg',r=>r.status||'started',loadOnboard);
+const retryOnboard=()=>post('/api/onboard/retry',{},'ob_msg',r=>r.status||'running',loadOnboard);
+const cancelOnboard=()=>sure('Cancel adding hardware? A running VM is stopped and its work thrown away.').then(ok=>ok&&post('/api/onboard/cancel',{},'ob_msg',()=>'cancelled',loadOnboard));
+// The installer ISO choice follows the OS chosen for the golden (Windows by default).
+function dlIsoOptions(keep){const sel=document.getElementById('dl_iso');if(!sel||!dlData)return;
+  const os=document.getElementById('dl_os').value,cur=keep??sel.value;
+  sel.innerHTML='<option value="">— none —</option>'+dlData.isos.filter(i=>i.os===os).map(i=>
+    `<option value="${esc(i.name)}"${i.name===cur?' selected':''}>${esc(i.name)}</option>`).join('');}
+function dlOsChanged(){const os=document.getElementById('dl_os').value,sz=document.getElementById('dl_size');
+  if(sz&&(sz.value==='256'||sz.value==='64'))sz.value=os==='linux'?'64':'256';dlIsoOptions('');}
+const dlCall=(url,body,q,msg)=>(q?sure(q):Promise.resolve(true)).then(ok=>ok&&post(url,body,msg||'dl_msg',r=>r.status||'saved',loadDiskless));
+const saveGolden=()=>dlCall('/api/diskless/golden',{name:v('dl_name'),os:v('dl_os'),size_gb:+v('dl_size'),iso:v('dl_iso')||null,groups:[v('dl_groups')]},null,'dl_fmsg');
+const setMaint=(name,el)=>dlCall('/api/diskless/maint',{name,id:el.value?+el.value:null});
+const saveMaint=name=>dlCall('/api/diskless/save',{name},'Save the maintenance work on '+name+' as its next version? Its maintenance machine must be shut down. Every machine gets it at its next boot (and sets itself up again).');
+const discardMaint=name=>dlCall('/api/diskless/discard',{name},'Throw the maintenance work on '+name+' away?');
+const refreshGolden=name=>dlCall('/api/diskless/refresh',{name},'Write Broom\'s current startup script into '+name+' and save it as its next version? Every machine sets itself up again at its next boot. Needs no maintenance machine and no unsaved work.');
+const delGolden=name=>dlCall('/api/diskless/golden/delete',{name},'Delete golden '+name+', all its versions and every machine\'s layers of it?');
+const isoOs=(name,el)=>dlCall('/api/diskless/iso/os',{name,os:el.value});
+const delIso=name=>dlCall('/api/diskless/iso/delete',{name},'Delete '+name+' from the ISO library?');
+const setPlace=k=>dlCall('/api/diskless/volume',{kind:k,id:document.getElementById('dl_place_'+k).value},null,'dl_pmsg');
+function editGolden(name){const g=dlData.goldens.find(x=>x.golden.name===name).golden;
+  for(const [k,val] of [['dl_name',g.name],['dl_os',g.os],['dl_size',g.size_gb],['dl_groups',g.groups.join(', ')]])document.getElementById(k).value=val;
+  dlIsoOptions(g.iso||'');}
+// ISO upload: same chunked protocol as goldens / drivers, with the OS chosen (Windows by default).
+async function uploadIso(){const f=document.getElementById('dl_isofile').files[0],msg=document.getElementById('dl_isomsg');
+  if(!f){toast('Choose an installer .iso',true);return;}
+  const name=f.name.replace(/[^A-Za-z0-9._-]/g,'-'),os=v('dl_isoos'),prog=document.getElementById('dl_isoprog');
+  try{await j('/api/diskless/iso/upload-start',mk({name,os}));
+    const q=[];for(let o=0;o===0||o<f.size;o+=CHUNK)q.push(o);
+    const t0=Date.now();let done=0;const bar=prog.firstElementChild;prog.style.display='';bar.style.width='0%';
+    const file=new File([f],name);
+    const lane=async()=>{while(q.length){const o=q.shift();
+      try{await putChunk('/api/diskless/iso',name,file,o);}catch(e){q.length=0;throw e;}
+      done+=Math.min(CHUNK,f.size-o);bar.style.width=done/f.size*100+'%';
+      msg.textContent=' upload '+Math.round(done/f.size*100)+'% · '+(done/1e6/Math.max(1,(Date.now()-t0)/1000)).toFixed(0)+' MB/s';}};
+    await Promise.all(Array.from({length:LANES},lane));
+    await j('/api/diskless/iso/upload-done',mk({name,os}));say(msg,' ✓ '+name+' added');}
+  catch(e){say(msg,' ✗ '+e.message);}
+  loadDiskless();}
+
 // ---- groups (Groups page) ----
 let grData=null,grCur=null;
 const grIn=(x,n)=>x.groups.some(y=>y.toLowerCase()===n.toLowerCase());
 const grNames=l=>l.length?l.map(x=>esc(x.name)+(x.letter?' ('+esc(x.letter)+':)':'')).join(', '):'—';
 async function loadGroups(){const g=grData=await j('/api/groups');const tb=document.querySelector('#groups tbody');if(!tb)return;
   const cnt=n=>g.machines.filter(m=>(m.grp||'').toLowerCase()===n.toLowerCase()).length;
-  tb.innerHTML=g.groups.map(n=>`<tr><td><b>${esc(n)}</b></td><td class="mono">${cnt(n)}</td>
-      <td>${grNames(g.images.filter(x=>grIn(x,n)))}</td><td>${grNames(g.disks.filter(x=>grIn(x,n)))}</td><td>${grNames(g.drivers.filter(x=>grIn(x,n)))}</td>
+  const nm=(g.new_machines||'').toLowerCase(),nmEl=document.getElementById('gr_newm');
+  if(nmEl&&document.activeElement!==nmEl)nmEl.value=g.new_machines||'';
+  const gl=document.getElementById('gr_grouplist');if(gl)gl.innerHTML=g.groups.map(x=>`<option value="${esc(x)}">`).join('');
+  tb.innerHTML=g.groups.map(n=>`<tr><td><b>${esc(n)}</b>${n.toLowerCase()===nm?' <span class="badge text-bg-warning" title="unknown PCs join it by themselves and wait here for you">new machines</span>':''}</td><td class="mono">${cnt(n)}</td>
+      <td>${grNames(g.images.filter(x=>grIn(x,n)))}</td><td>${grNames(g.disks.filter(x=>grIn(x,n)))}</td><td>${grNames((g.goldens||[]).filter(x=>grIn(x,n)))}</td><td>${grNames(g.drivers.filter(x=>grIn(x,n)))}</td>
       <td><div class="d-flex gap-1"><button class="btn btn-sm btn-outline-secondary" ${act('editGroup',n)}>Edit</button> <button class="btn btn-sm btn-outline-secondary" ${act('renameGroup',n)}>Rename</button> <button class="btn btn-sm btn-outline-danger" ${act('deleteGroup',n)}>Delete</button></div></td></tr>`).join('')
     +`<tr><td><i>every machine</i></td><td class="mono" title="machines without a group">${g.machines.filter(m=>!m.grp).length} without</td>
-      <td>${grNames(g.images.filter(x=>!x.groups.length))}</td><td>${grNames(g.disks.filter(x=>!x.groups.length))}</td><td>${grNames(g.drivers.filter(x=>x.all))}</td><td></td></tr>`;
+      <td>${grNames(g.images.filter(x=>!x.groups.length))}</td><td>${grNames(g.disks.filter(x=>!x.groups.length))}</td><td title="a golden boots only on the machines of its groups">—</td><td>${grNames(g.drivers.filter(x=>x.all))}</td><td></td></tr>`;
   if(grCur&&g.groups.some(n=>n===grCur))editGroup(grCur);else closeGroup();}
 function editGroup(n){if(!grData)return;grCur=n;const g=grData,lc=n.toLowerCase();
   document.getElementById('gr_edit').style.display='';document.getElementById('gr_title').textContent='Group '+n;document.getElementById('gr_emsg').textContent='';
@@ -671,21 +930,26 @@ function editGroup(n){if(!grData)return;grCur=n;const g=grData,lc=n.toLowerCase(
     esc(m.name)+(m.grp&&m.grp.toLowerCase()!==lc?` <span class="mono">(${esc(m.grp)})</span>`:''))).join('')||'—';
   document.getElementById('gr_images').innerHTML=g.images.map(i=>box(i.id,!i.groups.length||grIn(i,n),
     esc(i.name)+' '+osPill(i.os)+(i.groups.length?'':all),!i.groups.length,i.groups.length?'':allT)).join('')||'—';
-  document.getElementById('gr_disks').innerHTML=g.disks.map(d=>box(d.name,!d.groups.length||grIn(d,n),
-    esc(d.name)+' ('+esc(d.letter)+':)'+(d.groups.length?'':all),!d.groups.length,d.groups.length?'':allT)).join('')||'—';
+  // Each with the version this group boots (pins.rs): newest, or held on a kept one.
+  const pick=(key,d)=>`<select class="form-select form-select-sm w-auto py-0" data-ver="${esc(key)}" title="the version this group's machines boot">${verOpts(d.versions||[],pinOf(d.pins,n))}</select>`;
+  document.getElementById('gr_disks').innerHTML=g.disks.map(d=>'<div class="d-flex align-items-center gap-2">'+box(d.name,!d.groups.length||grIn(d,n),
+    esc(d.name)+' ('+esc(d.letter)+':)'+(d.groups.length?'':all),!d.groups.length,d.groups.length?'':allT)+pick('d'+d.name,d)+'</div>').join('')||'—';
+  document.getElementById('gr_goldens').innerHTML=(g.goldens||[]).map(d=>'<div class="d-flex align-items-center gap-2">'+box(d.name,grIn(d,n),esc(d.name)+' '+osPill(d.os))+pick('g'+d.name,d)+'</div>').join('')||'—';
   document.getElementById('gr_drivers').innerHTML=g.drivers.map(d=>box(d.id,d.all||grIn(d,n),
     esc(d.name)+(d.all?all:''),d.all,d.all?'for every machine — change it on the Drivers page':'')).join('')||'—';
   document.getElementById('gr_hide').checked=(g.hide_disks||[]).some(x=>x.toLowerCase()===lc);}
 function closeGroup(){grCur=null;const e=document.getElementById('gr_edit');if(e)e.style.display='none';}
 async function saveGroup(){const m=document.getElementById('gr_emsg');
   const ids=(id,num)=>[...document.querySelectorAll('#'+id+' input:checked:not(:disabled)')].map(e=>num?+e.dataset.v:e.dataset.v);
-  const body={name:grCur,machines:ids('gr_machines',1),images:ids('gr_images',1),disks:ids('gr_disks',0),drivers:ids('gr_drivers',1),hide_disks:document.getElementById('gr_hide').checked};
+  const versions=Object.fromEntries([...document.querySelectorAll('#gr_edit select[data-ver]')].map(e=>[e.dataset.ver,e.value===''?null:+e.value]));
+  const body={name:grCur,machines:ids('gr_machines',1),images:ids('gr_images',1),disks:ids('gr_disks',0),goldens:ids('gr_goldens',0),drivers:ids('gr_drivers',1),hide_disks:document.getElementById('gr_hide').checked,versions};
   try{await j('/api/groups/set',mk(body));say(m,' ✓ saved');}
   catch(e){if(/EVERY machine/.test(e.message)&&await sure(e.message+'.\n\nSave anyway?')){
       try{await j('/api/groups/set',mk({...body,allow_all:true}));say(m,' ✓ saved');}catch(e2){say(m,' ✗ '+e2.message);}}
     else say(m,' ✗ '+e.message);}
   loadGroups();}
 const grCall=(url,body,el)=>post(url,body,el||'gr_msg','done',loadGroups);
+const saveNewMachines=()=>post('/api/groups/new-machines',{group:v('gr_newm')},'gr_nmsg',()=>v('gr_newm')?'unknown PCs join '+v('gr_newm'):'off',loadGroups);
 const createGroup=()=>{const n=v('gr_new');if(n)grCall('/api/groups/create',{name:n}).then(()=>{document.getElementById('gr_new').value='';});};
 async function renameGroup(n){const to=await ask('Rename group '+n,'New name (an existing name merges the two):',n);
   if(to&&to!==n){if(grCur===n)grCur=to.trim();grCall('/api/groups/rename',{from:n,to});}}
@@ -744,6 +1008,26 @@ async function userPw(name,role){const p=await ask('New password for '+name,'At 
   try{cred=sealFor(name,p);}catch(e){say(document.getElementById('us_msg'),' ✗ '+e.message);return;}
   userCall('/api/users',{name,role,cred},'password of '+name+' changed');}
 async function userDel(name){if(await sure('Delete account '+name+'? Their open sessions end.'))userCall('/api/users/delete',{name},name+' deleted');}
+// ---- HTTPS for the web admin (tls.rs; owners) ----
+const fpFmt=h=>(h||'').toUpperCase().match(/../g)?.join(':')||'';
+async function loadTls(){if(!me.role)await loadMe();const el=document.getElementById('tls_info');if(!el||me.role!=='owner')return;
+  let t;try{t=await j('/api/config/tls');}catch(e){say(el,' ✗ '+e.message);return;}
+  document.getElementById('tls_on').checked=!!t.https;
+  const until=t.until?new Date(t.until*1000):null,soon=until&&until-Date.now()<30*86400e3;
+  el.innerHTML=(t.listening?`${ic('ok')} HTTPS on port ${esc(t.port)}`:`${ic('err')} HTTPS is not running (port ${esc(t.port)} taken? see Logs) — the web admin is on plain HTTP`)
+    +`<br>${t.kind==='uploaded'?'Your certificate':'Self-signed certificate'+(t.names?.length?' for '+esc(t.names.join(', ')):'')}`
+    +(until?` · valid until <span class="${soon?'text-danger fw-semibold':''}">${esc(until.toLocaleDateString())}</span>${t.kind!=='uploaded'?' (renewed by itself)':''}`:'')
+    +`<br>SHA-256 <span class="mono" style="word-break:break-all">${esc(fpFmt(t.sha256))}</span>`;}
+async function tlsOn(el){const on=el.checked;
+  if(!on&&!await sure('Serve the web admin on plain http:// too? Passwords never travel, but the session and every page do, readable on the network.')){el.checked=true;return;}
+  await post('/api/config/tls',{https:on},'tls_msg',on?'HTTPS only':'plain HTTP too',loadTls);}
+async function tlsUpload(){const m=document.getElementById('tls_msg'),c=document.getElementById('tls_cert').files[0],k=document.getElementById('tls_key').files[0];
+  if(!c||!k){say(m,' ✗ pick the certificate and its key');return;}
+  if(!await sure('Use this certificate now? Open the page by a name it was made for, or browsers will warn.'))return;
+  await post('/api/config/tls',{cert:await c.text(),key:await k.text()},'tls_msg','in use — reload the page',loadTls);
+  document.getElementById('tls_key').value='';}
+async function tlsSelfSigned(){if(!await sure('Make a new self-signed certificate? Browsers warn again once (new fingerprint).'))return;
+  await post('/api/config/tls',{self_signed:true},'tls_msg','new certificate in use — reload the page',loadTls);}
 async function setTimeout_(){await j('/api/config/timeout',mk({seconds:+document.getElementById('timeout').value}));say(document.getElementById('to_msg'),' ✓ saved');}
 async function setSsd(){const m=document.getElementById('ssd_msg');
   try{await j('/api/config/ssd',mk({room_gb:+v('ssd_room'),warn_gb:+v('ssd_warn'),reboot_gb:+v('ssd_reboot'),pagefile_gb:+v('ssd_pagefile')}));say(m,' ✓ saved');}
@@ -1171,10 +1455,11 @@ const ACTIONS={
   loadImages,addImage,setDefault,toggleCache,toggleSsd,togglePreload,editImgGroups,republish,showVersions,exportImage,editBoot,delImage,
   snapshotImage,dedupImage,rollbackImage,versionToImage,deleteVersion,
   loadGames,saveGames,setGamesUpdate,toggleGamesRam,saveGamesUpdate,discardGamesUpdate,editGames,delGames,
+  loadDiskless,dlOsChanged,mPower,mSelOne,mSelAll,hwToggle,hwDisplay,mDisplay,startOnboard,cancelOnboard,retryOnboard,verToggle,verPin,verDrop,verKeepFree,vmStart,vmStop,vmGamesSave,vmGamesDiscard,saveGolden,setMaint,saveMaint,discardMaint,refreshGolden,delGolden,editGolden,isoOs,delIso,setPlace,uploadIso,
   loadDrivers,uploadDriver,saveDrvTargets,delDriver,
-  loadGroups,editGroup,closeGroup,saveGroup,createGroup,renameGroup,deleteGroup,
+  loadGroups,editGroup,closeGroup,saveGroup,createGroup,renameGroup,deleteGroup,saveNewMachines,
   loadServer,loadBench,loadBenchHist,logsReload,logsFollow,logsSearch,benchServer,benchRequest:()=>benchAsk(false),benchCancel:()=>benchAsk(true),bSelAll,
-  applyDhcp,savePw,saveCafe,setTimeout_,setZramReserve,setAlert,setSsd,gsMode,setGoldenStreams,logout,
+  applyDhcp,savePw,saveCafe,setTimeout_,tlsOn,tlsUpload,tlsSelfSigned,setZramReserve,setAlert,setSsd,gsMode,setGoldenStreams,logout,
   remoteTo,rmGo,rmConnect,rmClose,rmBack,rmWallSize,rmWallFilter,rmWallPrev,rmWallNext,rmQuality,rmFull,rmSas,rmWin,rmAltTab,rmPaste,loadRemote,
 };
 

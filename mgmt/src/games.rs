@@ -45,6 +45,9 @@ pub struct Disk {
     /// Served from a copy in the server's RAM (the iSCSI daemon) instead of reading games.img.
     #[serde(default)]
     pub ram: bool,
+    /// Groups held on a version (group → version; a group not listed gets the newest): pins.rs.
+    #[serde(default)]
+    pub pins: std::collections::BTreeMap<String, u64>,
 }
 
 pub(crate) fn disks(st: &SharedState) -> Vec<Disk> {
@@ -104,21 +107,42 @@ fn ip_of(st: &SharedState, id: i64) -> Option<String> {
 }
 
 fn configs(st: &SharedState) -> Vec<Config> {
+    with_groups(st).into_iter().map(|(c, _)| c).collect()
+}
+
+/// The disks served, each with the groups that get it (no group = every machine): diskless.rs gives each diskless
+/// machine of those groups its own copy (golden.rs Config.games).
+pub(crate) fn with_groups(st: &SharedState) -> Vec<(Config, Vec<String>)> {
     let base = st.db.get_config("iqn_base", "iqn.2026-01.local.broom");
     disks(st)
         .into_iter()
         .filter(|d| img(&d.name).exists())
-        .map(|d| Config {
-            iqn: format!("{base}:games-{}", d.name),
-            path: img(&d.name).to_string_lossy().into(),
-            update_ip: d.update.and_then(|id| ip_of(st, id)),
-            update_mac: d
-                .update
-                .and_then(|id| machine_by_id(st, id).ok())
-                .map(|m| m.mac.to_lowercase()),
-            ram: d.ram,
-            reserve: crate::publish::ram_reserve(st),
-            name: d.name,
+        .map(|d| (d.groups.clone(), d))
+        .map(|(groups, d)| {
+            (
+                Config {
+                    iqn: format!("{base}:games-{}", d.name),
+                    path: img(&d.name).to_string_lossy().into(),
+                    // The maintenance VM on this server holds it (vmmaint.rs): it writes through 127.0.0.1.
+                    update_ip: if crate::vmmaint::owns_games(&d.name) {
+                        Some("127.0.0.1".into())
+                    } else {
+                        d.update.and_then(|id| ip_of(st, id))
+                    },
+                    update_mac: d
+                        .update
+                        .filter(|_| !crate::vmmaint::owns_games(&d.name))
+                        .and_then(|id| machine_by_id(st, id).ok())
+                        .map(|m| m.mac.to_lowercase()),
+                    ram: d.ram,
+                    reserve: crate::publish::ram_reserve(st),
+                    retain: true,
+                    min_free_pct: crate::pins::min_free_pct(st),
+                    keep_from: crate::pins::keep_from(&d.pins),
+                    name: d.name,
+                },
+                groups,
+            )
         })
         .collect()
 }
@@ -143,6 +167,10 @@ pub fn sync_except(st: &SharedState, skip: Option<&str>) -> Result<(), String> {
     } else {
         crate::iscsi::games_set(list)
     };
+    // The diskless machines' own copies follow the disks (added, deleted, their groups).
+    if r.is_ok() {
+        let _ = crate::diskless::sync(st);
+    }
     let mut last = LAST_ERR.lock();
     match &r {
         Err(e) if last.as_deref() != Some(e.as_str()) => {
@@ -272,6 +300,9 @@ async fn upsert(
             groups: groups.clone(),
             update: old.and_then(|i| list[i].update),
             ram: old.is_some_and(|i| list[i].ram),
+            pins: old
+                .map(|i| crate::pins::pruned(&list[i].pins, &groups, true))
+                .unwrap_or_default(),
         };
         if let Some(o) = list.iter().find(|o| clash(&d, o)) {
             return Err(bad(format!(
@@ -482,6 +513,7 @@ async fn save(
     Json(b): Json<NameBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     find(&st, &b.name)?;
+    vm_off(&b.name)?;
     let (name, st2) = (b.name.clone(), st.clone());
     let msg = tokio::task::spawn_blocking(move || {
         with_update_off(&st2, &name, || crate::iscsi::games_save(&name))
@@ -489,8 +521,28 @@ async fn save(
     .await
     .map_err(ise)?
     .map_err(|e| (StatusCode::CONFLICT, e))?;
+    let newest = crate::iscsi::games_status()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|i| i.name == b.name)
+        .map_or(0, |i| i.ver);
+    let msg = format!(
+        "{msg}{}",
+        crate::pins::held_note(&find(&st, &b.name)?.pins, newest)
+    );
     tracing::info!("iSCSI disk {}: {msg}", b.name);
     Ok(Json(serde_json::json!({"ok": true, "status": msg})))
+}
+
+/// Save / Discard wait for the maintenance VM to be off (the disk is still attached to it until then).
+fn vm_off(name: &str) -> Result<(), ApiError> {
+    if crate::vmmaint::owns_games(name) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("{name} is attached to the VM (Maintain in the browser) — shut it down first"),
+        ));
+    }
+    Ok(())
 }
 
 /// POST /api/games/discard {name} — throw the disk's update away.
@@ -499,6 +551,7 @@ async fn discard(
     Json(b): Json<NameBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     find(&st, &b.name)?;
+    vm_off(&b.name)?;
     let (name, st2) = (b.name.clone(), st.clone());
     tokio::task::spawn_blocking(move || {
         with_update_off(&st2, &name, || crate::iscsi::games_discard(&name))
@@ -525,7 +578,8 @@ async fn for_client(
     else {
         return String::new();
     };
-    let grp = machine_at(&st, &ip).and_then(|m| m.grp);
+    let me = machine_at(&st, &ip);
+    let grp = me.as_ref().and_then(|m| m.grp.clone());
     let cfgs = configs(&st);
     let mut out = String::new();
     for d in disks(&st)
@@ -539,10 +593,27 @@ async fn for_client(
             continue;
         };
         let upd = c.update_ip.as_deref() == Some(ip.as_str());
-        out.push_str(&format!(
-            "{} {}.g{} {} {}\n",
-            d.name, c.iqn, i.ver, d.letter, upd as u8
-        ));
+        // A diskless machine (no SSD for its writes): its own copy of the disk on the server, writable (mode 2). Its
+        // update machine gets the disk itself (mode 1), as on an SSD machine.
+        let own = (!upd)
+            .then(|| {
+                let m = me.as_ref()?;
+                let x = crate::diskless::games_served(&d.name, &m.mac)?;
+                x.session_ver?;
+                crate::iscsid::golden::machine_iqn(&c.iqn, &m.mac)
+            })
+            .flatten();
+        // The version its group is held on (pins.rs) while still kept; the update machine always works on the newest.
+        let ver = crate::pins::pin_for(&d.pins, grp.as_deref())
+            .filter(|v| !upd && i.versions.iter().any(|x| x.ver == *v))
+            .unwrap_or(i.ver);
+        match own {
+            Some(t) => out.push_str(&format!("{} {t} {} 2\n", d.name, d.letter)),
+            None => out.push_str(&format!(
+                "{} {}.g{} {} {}\n",
+                d.name, c.iqn, ver, d.letter, upd as u8
+            )),
+        }
     }
     out
 }

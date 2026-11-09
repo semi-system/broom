@@ -110,6 +110,9 @@ fn linux_client_boots() {
             .get(&format!("/boot/start?image=ubu&mac={MAC_S}&ip={ip}"))
             .text();
         assert!(script.contains(&format!("set broom-srv {SRV}")), "{script}");
+        // iPXE's leftover images (the EFI autoexec.ipxe) freed before the kernel: iPXE would hand them over as initrd.
+        let free = script.find("\nimgfree\n").expect("imgfree line");
+        assert!(free < script.find("\nkernel ").unwrap(), "{script}");
         assert!(
             script.contains(&format!("root=UUID={}", g.uuid)),
             "{script}"

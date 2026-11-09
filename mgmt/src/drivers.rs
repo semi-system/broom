@@ -95,6 +95,109 @@ fn inf_hwids(text: &str) -> BTreeSet<String> {
     out
 }
 
+/// A network-card driver: its .inf's [Version] says Class=Net (or the Net class GUID).
+pub(crate) fn inf_is_net(text: &str) -> bool {
+    text.lines().any(|l| {
+        let l: String = l
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        l == "class=net" || l.starts_with("classguid={4d36e972-e325-11ce-bfc1-08002be10318}")
+    })
+}
+
+/// Packages already checked for a network-card .inf, by sha256 (a package's files never change under one sha256).
+static NET: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, bool>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Package `d` holds a network-card driver (read from its tar.gz once). Blocking.
+pub(crate) fn is_net(d: &Driver) -> bool {
+    if let Some(&v) = NET.lock().get(&d.sha256) {
+        return v;
+    }
+    let v = crate::archive::tar_gz_files(&tar_path(&d.name)).is_ok_and(|files| {
+        files
+            .iter()
+            .any(|(p, b)| p.to_ascii_lowercase().ends_with(".inf") && inf_is_net(&inf_text(b)))
+    });
+    NET.lock().insert(d.sha256.clone(), v);
+    v
+}
+
+/// The network-card packages of the library (Add hardware: into Windows PE, and into the golden). Blocking.
+pub(crate) fn net_drivers(st: &SharedState) -> Vec<Driver> {
+    st.db
+        .drivers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_net)
+        .collect()
+}
+
+/// `PCI\VEN_xxxx&DEV_yyyy` of a full hardware ID (`…&SUBSYS_…&REV_…`), upper-case; None for anything else.
+pub(crate) fn ven_dev(id: &str) -> Option<String> {
+    let u = id.to_ascii_uppercase();
+    let set = inf_hwids(&u);
+    set.into_iter().next().filter(|s| u.starts_with(s.as_str()))
+}
+
+/// The packages whose .inf names one of `hwids` (a card's hardware IDs, as Windows reports them).
+pub(crate) fn matching<'a>(drivers: &'a [Driver], hwids: &[String]) -> Vec<&'a Driver> {
+    let want: BTreeSet<String> = hwids.iter().filter_map(|h| ven_dev(h)).collect();
+    drivers
+        .iter()
+        .filter(|d| d.hwids.iter().any(|x| want.contains(x)))
+        .collect()
+}
+
+/// A Windows PE bundle: (the packages' names + sha256s it was built from, the tar).
+type Bundle = (String, std::sync::Arc<Vec<u8>>);
+
+/// The last Windows PE bundle built.
+static BUNDLE: std::sync::LazyLock<parking_lot::Mutex<Option<Bundle>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Every network-card package as one plain tar for Windows PE (Add hardware): `<package>/<its files>`. broom-report.exe
+/// unpacks it and loads each .inf (drvload) before it looks for the network, so a card Windows PE has no driver for
+/// can still report. None = no network-card package in the library. Built again only when the packages change.
+/// Blocking.
+pub(crate) fn winpe_bundle(st: &SharedState) -> Result<Option<std::sync::Arc<Vec<u8>>>, String> {
+    let mut nets = net_drivers(st);
+    if nets.is_empty() {
+        return Ok(None);
+    }
+    nets.sort_by(|a, b| a.name.cmp(&b.name));
+    let key: String = nets
+        .iter()
+        .map(|d| format!("{}:{} ", d.name, d.sha256))
+        .collect();
+    if let Some((k, b)) = BUNDLE.lock().as_ref()
+        && *k == key
+    {
+        return Ok(Some(b.clone()));
+    }
+    let mut files = Vec::new();
+    for d in &nets {
+        for (p, b) in crate::archive::tar_gz_files(&tar_path(&d.name))? {
+            files.push((format!("{}/{p}", d.name), b));
+        }
+    }
+    let b = std::sync::Arc::new(crate::archive::tar(&files)?);
+    tracing::info!(
+        "add hardware: {} network-card package(s) for Windows PE, {:.1} MB",
+        nets.len(),
+        b.len() as f64 / 1e6
+    );
+    *BUNDLE.lock() = Some((key, b.clone()));
+    Ok(Some(b))
+}
+
+/// Package `d`'s files under `dest` (Add hardware: into the golden). Blocking.
+pub(crate) fn unpack(d: &Driver, dest: &std::path::Path) -> Result<(), String> {
+    crate::archive::untar_gz(&tar_path(&d.name), dest)
+}
+
 /// Packages one machine gets: a hardware ID matches, the package targets its group, or "all machines".
 pub(crate) fn pick<'a>(
     drivers: &'a [Driver],
@@ -171,6 +274,11 @@ async fn list(State(st): State<SharedState>) -> Result<Json<Vec<serde_json::Valu
         .into_iter()
         .map(|(mac, ids)| (mac.to_lowercase(), ids.into_iter().collect()))
         .collect();
+    // Network-card or not: read from each package once (cached by sha256), off the async threads.
+    let d2 = drivers.clone();
+    let nets: Vec<bool> = tokio::task::spawn_blocking(move || d2.iter().map(is_net).collect())
+        .await
+        .map_err(ise)?;
     let mut gets: HashMap<i64, Vec<String>> = HashMap::new();
     for m in &machines {
         let ids = hw.get(&m.mac.to_lowercase()).cloned().unwrap_or_default();
@@ -181,9 +289,11 @@ async fn list(State(st): State<SharedState>) -> Result<Json<Vec<serde_json::Valu
     Ok(Json(
         drivers
             .iter()
-            .map(|d| {
+            .zip(nets)
+            .map(|(d, net)| {
                 let mut v = serde_json::to_value(d).unwrap_or_default();
                 v["machines"] = gets.remove(&d.id).unwrap_or_default().into();
+                v["net"] = net.into();
                 v
             })
             .collect(),

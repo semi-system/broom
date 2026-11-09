@@ -144,6 +144,9 @@ pub trait Db: Send + Sync {
     fn machines(&self) -> DbResult<Vec<Machine>>;
     /// Returns the new id.
     fn add_machine(&self, mac: &str, ip: Option<&str>, hostname: Option<&str>) -> DbResult<i64>;
+    /// A new machine with its mac / ip / hostname / group / notes in one step (never there without its group). Returns
+    /// the new id.
+    fn add_machine_row(&self, m: &Machine) -> DbResult<i64>;
     /// Replace the editable fields of a machine (mac must stay unique).
     fn update_machine(&self, m: &Machine) -> DbResult<()>;
     fn delete_machine(&self, machine_id: i64) -> DbResult<()>;

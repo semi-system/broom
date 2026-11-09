@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VM screen · Broom</title>
+  <link rel="stylesheet" href="/bootstrap.min.css">
+  <link rel="stylesheet" href="/app.css">
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; flex-direction: column; background: var(--bs-body-bg); }
+    #bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: .5rem .75rem; border-bottom: 1px solid var(--bs-border-color); }
+    #bar .title { font-weight: 600; margin-right: .25rem; }
+    #state { font-size: .875rem; }
+    #screen { flex: 1 1 auto; min-height: 0; background: #111; position: relative; }
+    #note { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #ccc; padding: 1rem; text-align: center; pointer-events: none; }
+    #note.hidden { display: none; }
+  </style>
+  <script type="module" src="/vm-console.js"></script>
+</head>
+<body>
+  <div id="bar">
+    <a class="btn btn-sm btn-outline-secondary" href="/diskless">← Diskless</a>
+    <span class="title" id="title">VM</span>
+    <span id="state" class="text-body-secondary">connecting…</span>
+    <span class="flex-grow-1"></span>
+    <button class="btn btn-sm btn-outline-secondary" id="cad" title="Send Ctrl+Alt+Del to Windows (sign-in, Task Manager)">Ctrl+Alt+Del</button>
+    <button class="btn btn-sm btn-outline-secondary" id="scale" title="Fit the screen to the window, or show it at its real size">Real size</button>
+    <button class="btn btn-sm btn-outline-secondary" id="full">Full screen</button>
+    <button class="btn btn-sm btn-outline-secondary" id="again" hidden>Reconnect</button>
+    <button class="btn btn-sm btn-outline-warning" id="off" title="Press the power button: Windows shuts down">Shut down</button>
+    <button class="btn btn-sm btn-outline-danger" id="kill" title="Turn the VM off at once, like pulling the plug — only if Windows hangs">Turn off</button>
+  </div>
+  <div id="screen"><div id="note">Connecting to the VM…</div></div>
+</body>
+</html>

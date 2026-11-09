@@ -438,3 +438,9 @@ fn fuzz_packets() {
         }
     });
 }
+
+#[test]
+fn router_boot_file_follows_secure_boot_clients() {
+    assert_eq!(router_boot_file(true), "sb/snponly-shim.efi");
+    assert_eq!(router_boot_file(false), "snponly.efi");
+}

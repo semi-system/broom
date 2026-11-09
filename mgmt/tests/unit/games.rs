@@ -9,6 +9,7 @@ fn drive_letters_clash_only_for_shared_machines() {
         groups: groups.iter().map(|g| g.to_string()).collect(),
         update: None,
         ram: false,
+        pins: Default::default(),
     };
     assert!(
         clash(&d("a", "G", &[]), &d("b", "G", &["VIP"])),

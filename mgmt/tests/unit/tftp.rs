@@ -152,3 +152,25 @@ fn fuzz_rrq() {
         let _ = parse_rrq(b);
     });
 }
+
+#[test]
+fn shim_extras_are_known() {
+    for f in [
+        "sb/revocations_sku.efi",
+        "sb/revocations_sbat.efi",
+        "sb/shim_certificate_0.efi",
+        "/sb/mmx64.efi",
+        "sb\\fbx64.efi",
+    ] {
+        assert!(shim_extra(f), "{f}");
+    }
+    for f in [
+        "revocations_sbat.efi",
+        "sb/other.efi",
+        "sb/revocations_x.txt",
+        "sb/sub/revocations_sbat.efi",
+        "sb/snponly.efi",
+    ] {
+        assert!(!shim_extra(f), "{f}");
+    }
+}

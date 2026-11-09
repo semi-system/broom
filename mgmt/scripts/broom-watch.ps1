@@ -5,8 +5,14 @@
 # the restart threshold -> restart in 60 s with a message: the session is lost either way, this way with time to save.
 # Thresholds: Settings -> SSD room (GET /api/client-config "<room> <warn> <reboot>" GB). Started once per boot by
 # broom-bootorder.ps1 as its own task (SYSTEM). ASCII only.
-param([string]$Srv, [string]$Vol)
+# Diskless machines (no SSD, no BROOMWIN): broom-diskless.ps1 starts it with -Dir C:\ProgramData\Broom (agent files +
+# the machine's agent key, kept in its base layer) instead of -Vol: the Remote agent, the boot time and the games disks
+# (broom-games.ps1, at start and every 5 minutes, as broom-bootorder does on SSD machines), no SSD checks. -Prepare: build the agent's Temp copy, then stop (the first boot does it, so the base keeps it).
+param([string]$Srv, [string]$Vol, [string]$Dir, [switch]$Prepare)
 $ErrorActionPreference = 'SilentlyContinue'
+# Where the agent's files and key are: BROOMWIN's broom folder (SSD machines) or -Dir (diskless).
+$agentDir = if ($Vol) { "$Vol\broom" } elseif ($Dir) { $Dir } else { $null }
+$ssd = -not ($Dir -and -not $Vol)
 # BROOMWIN's free space: GetDiskFreeSpaceEx (broom-fw.dll) on the volume path broom-bootorder.ps1 passes as -Vol - well
 # under a millisecond, and without the Storage module this process holds ~100 MB less all session. No DLL / no -Vol
 # (older bootorder script): Get-Volume as before.
@@ -26,15 +32,16 @@ if ($Vol -and [IO.File]::Exists("$Vol\broom\broom-fw.dll")) {
   } catch { }
 }
 function FreeBytes {
+  if (-not $ssd) { return -1 }
   if ($fw) { return [BroomFw]::Free("$Vol\") }
   $v = Get-Volume -FileSystemLabel BROOMWIN
   if ($v) { [int64]$v.SizeRemaining } else { -1 }
 }
 $warn = 10GB; $reboot = 3GB
-try {
+if ($ssd -and -not $Prepare) { try {
   $c = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri "http://$Srv/api/client-config").Content.Trim() -split '\s+'
   if ($c.Count -ge 3 -and $c[1] -match '^\d+$' -and $c[2] -match '^\d+$') { $warn = [int64]$c[1] * 1GB; $reboot = [int64]$c[2] * 1GB }
-} catch { }
+} catch { } }
 function Report($free) {
   try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Method Post -Uri "http://$Srv/api/ssd-low?free=$free" | Out-Null } catch { }
 }
@@ -44,8 +51,8 @@ function Report($free) {
 # The agent's Temp copy, named after its source's sha256 (see Sha16), worked out once: the source only changes at boot
 # (the stage). Release: the shipped exe; local build: compiled from broom-vnc.cs.
 $agentExe = $null
-if ($Vol) {
-  $ship = "$Vol\broom\broom-vnc.exe"; $cs = "$Vol\broom\broom-vnc.cs"
+if ($agentDir) {
+  $ship = "$agentDir\broom-vnc.exe"; $cs = "$agentDir\broom-vnc.cs"
   $from = if ([IO.File]::Exists($ship)) { $ship } elseif ([IO.File]::Exists($cs)) { $cs } else { $null }
   if ($from) {
     try {
@@ -57,12 +64,18 @@ if ($Vol) {
           # -CompilerOptions, and the agent needs /unsafe.
           $csc = "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
           if (-not [IO.File]::Exists($csc)) { $csc = "$env:SystemRoot\Microsoft.NET\Framework\v4.0.30319\csc.exe" }
-          & $csc /nologo /unsafe /target:winexe /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll "/out:$agentExe" $cs | Out-Null
+          # From a Temp copy: csc cannot open BROOMWIN's \\?\Volume{...} path (CS0010 "The filename, directory name,
+          # or volume label syntax is incorrect") - no agent on SSD machines of a local build. PowerShell can copy it.
+          $src = "$env:SystemRoot\Temp\broom-vnc-src.cs"
+          [IO.File]::Copy($cs, $src, $true)
+          & $csc /nologo /unsafe /target:winexe /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll "/out:$agentExe" $src | Out-Null
+          Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue
         }
       }
     } catch { $agentExe = $null }
   }
 }
+if ($Prepare) { return }
 function StartAgent {
   if (-not $agentExe -or -not [IO.File]::Exists($agentExe)) { return }
   # An agent of another build still running (an older Temp copy, kept in base): stop it, or its mutex keeps this one
@@ -71,13 +84,24 @@ function StartAgent {
     ForEach-Object { try { $_.Kill(); $_.WaitForExit(5000) | Out-Null } catch { } }
   Get-ChildItem "$env:SystemRoot\Temp\broom-vnc*.exe" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $agentExe } |
     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
-  # Its key (agentauth.rs), left on BROOMWIN by the stage: read here (PowerShell reads the volume path the agent's
-  # .NET 4 file API can't), handed over on its command line. No key yet = the agent waits for the next boot.
+  # Its key (agentauth.rs), left on BROOMWIN by the stage (diskless: in -Dir, by broom-diskless.ps1): read here
+  # (PowerShell reads the volume path the agent's .NET 4 file API can't), handed over on its command line. No key yet
+  # = the agent waits for the next boot.
   $key = ''
-  try { if ($Vol) { $key = ([IO.File]::ReadAllText("$Vol\broom\agent.key")).Trim() } } catch { }
+  try { if ($agentDir) { $key = ([IO.File]::ReadAllText("$agentDir\agent.key")).Trim() } } catch { }
   try { Start-Process $agentExe -ArgumentList $Srv, $key -WindowStyle Hidden } catch { }
 }
 StartAgent
+# Diskless: the games disks (each its own copy on the server), at start and every 5 minutes (a disk added, its update
+# machine changed). Its own process: it waits for the server and the iSCSI logins.
+$gamesAt = [datetime]::MinValue
+function Games {
+  if ($ssd -or -not $Dir -or -not [IO.File]::Exists("$Dir\broom-games.ps1")) { return }
+  if (((Get-Date) - $gamesAt).TotalMinutes -lt 5) { return }
+  $script:gamesAt = Get-Date
+  try { Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$Dir\broom-games.ps1`" -Srv $Srv" -WindowStyle Hidden } catch { }
+}
+Games
 # Other disks hidden from the guest (Devices / Groups page; the stage leaves broom\hide-disks): every internal disk but
 # the Broom disk taken offline, again every 15 s (the guest is an admin and could bring one back). Offline is kept in
 # the registry, which resets with the session: turned off on the server, the disks are back after the next boot.
@@ -126,5 +150,6 @@ while ($true) {
   }
   StartAgent   # re-ensure the remote agent is up (guest killed it, or it crashed)
   HideDisks
+  Games
   Start-Sleep 15
 }

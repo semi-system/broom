@@ -48,9 +48,10 @@ sudo ./bootrom-mgmt install-service
 journalctl -u bootrom-mgmt -f      # shows the one-time setup token
 ```
 
-Open `http://<server-ip>/`, enter the setup token and set the **owner** password. The first start downloads the web
-UI, iPXE and scripts (`broom-assets.zip`) of its own release; an offline server needs that file, and
-`broom-stage.tar.gz` for Windows, copied next to the binary.
+Open `http://<server-ip>/`: it moves to `https://` with the server's self-signed certificate, so the browser warns
+once (the fingerprint is on **Settings → HTTPS**). Enter the setup token and set the **owner** password. The first
+start downloads the web UI, iPXE and scripts (`broom-assets.zip`) of its own release; an offline server needs that
+file, and `broom-stage.tar.gz` for Windows, copied next to the binary.
 
 ## 3. Network boot {#network-boot}
 

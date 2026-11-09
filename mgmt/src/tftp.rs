@@ -95,6 +95,22 @@ fn load(name: &str, server: Ipv4Addr) -> Result<Cow<'static, [u8]>, String> {
     }
 }
 
+/// Files the Secure Boot shim (shim 16) looks for next to itself at every start and does without when they are not
+/// there: SBAT / SKU revocation updates, extra certificates, MokManager, fallback. "Not found" is the normal answer, so
+/// it is not logged as a warning at every PC's boot (a router's DHCP handing out the shim makes every PC ask).
+fn shim_extra(name: &str) -> bool {
+    let name = name.replace('\\', "/").to_ascii_lowercase();
+    let Some(f) = name.trim_start_matches('/').strip_prefix("sb/") else {
+        return false;
+    };
+    (f.starts_with("revocations_")
+        || f.starts_with("shim_certificate_")
+        || f == "mmx64.efi"
+        || f == "fbx64.efi")
+        && f.ends_with(".efi")
+        && !f.contains('/')
+}
+
 /// First script of every iPXE: configure the NIC by DHCP, then the server's boot menu. `ifconf -c dhcp`, not `dhcp`:
 /// that one runs every configurator, IPv6 router discovery too, which on a LAN without an IPv6 router waits out its
 /// backoff (~3.9 s) before the menu. An address already there (the firmware's PXE DHCP answer, which iPXE loaded over
@@ -163,6 +179,12 @@ async fn transfer(
         Ok(d) => d,
         Err(e) => {
             send_error(&sock, peer, 1, "file not found").await;
+            if shim_extra(&name) {
+                tracing::debug!(
+                    "tftp {peer}: the Secure Boot shim looked for {name} (optional, not served)"
+                );
+                return Ok(());
+            }
             return Err(e);
         }
     };

@@ -58,6 +58,20 @@ pub fn export(iqn: &str, path: &str, ram: bool, reserve: u64) -> Result<(), Stri
         ram,
         reserve,
         stamp: String::new(),
+        cd: false,
+    }))
+    .map(|_| ())
+}
+
+/// Serve the ISO at `path` as a read-only DVD-ROM target `iqn` (an installer, diskless.rs). Instant (file-backed).
+pub fn export_cd(iqn: &str, path: &str) -> Result<(), String> {
+    call_up(&Req::Export(Entry {
+        iqn: iqn.into(),
+        path: path.into(),
+        ram: false,
+        reserve: 0,
+        stamp: String::new(),
+        cd: true,
     }))
     .map(|_| ())
 }
@@ -92,6 +106,92 @@ pub fn games_save(name: &str) -> Result<String, String> {
 
 pub fn games_discard(name: &str) -> Result<(), String> {
     call(&Req::GamesDiscard { name: name.into() }).map(|_| ())
+}
+
+/// Serve exactly these diskless goldens (and their machines).
+pub fn diskless_set(goldens: Vec<crate::iscsid::golden::Config>) -> Result<(), String> {
+    call_up(&Req::DisklessSet { goldens }).map(|_| ())
+}
+
+/// Every golden served, with its machines. None = no daemon (or one of a build without goldens).
+pub fn diskless_status() -> Option<Vec<crate::iscsid::golden::Info>> {
+    call(&Req::DisklessStatus).ok().map(|r| r.goldens)
+}
+
+/// Machine `mac` is about to boot golden `name`: its session layer is reset (or, `promote`, kept as its base).
+pub fn diskless_prepare(
+    name: &str,
+    mac: &str,
+    promote: bool,
+    drop_base: bool,
+    ver: Option<u64>,
+) -> Result<crate::iscsid::golden::Prepared, String> {
+    call(&Req::DisklessPrepare {
+        name: name.into(),
+        mac: mac.into(),
+        promote,
+        drop_base,
+        games: false,
+        ver,
+    })
+    .and_then(|r| r.prepared.ok_or_else(|| "daemon of an older build".into()))
+}
+
+/// Diskless machine `mac` is about to boot: its own copy of games disk `name` reads the newest version again, its
+/// writes of the last boot dropped.
+pub fn diskless_games_prepare(
+    name: &str,
+    mac: &str,
+    ver: Option<u64>,
+) -> Result<crate::iscsid::golden::Prepared, String> {
+    call(&Req::DisklessPrepare {
+        name: name.into(),
+        mac: mac.into(),
+        promote: false,
+        drop_base: true,
+        games: true,
+        ver,
+    })
+    .and_then(|r| r.prepared.ok_or_else(|| "daemon of an older build".into()))
+}
+
+/// Delete machine `mac`'s layers of golden `name`.
+pub fn diskless_forget(name: &str, mac: &str) -> Result<(), String> {
+    call(&Req::DisklessForget {
+        name: name.into(),
+        mac: mac.into(),
+        games: false,
+    })
+    .map(|_| ())
+}
+
+/// Delete machine `mac`'s own copy (its layer) of games disk `name`.
+pub fn diskless_games_forget(name: &str, mac: &str) -> Result<(), String> {
+    call(&Req::DisklessForget {
+        name: name.into(),
+        mac: mac.into(),
+        games: true,
+    })
+    .map(|_| ())
+}
+
+pub fn golden_save(name: &str) -> Result<String, String> {
+    call(&Req::GoldenSave { name: name.into() }).map(|r| r.msg)
+}
+
+pub fn golden_discard(name: &str) -> Result<(), String> {
+    call(&Req::GoldenDiscard { name: name.into() }).map(|_| ())
+}
+
+/// Drop the oldest kept version of golden (`golden`) / games disk `name` → the version dropped.
+pub fn version_drop(name: &str, golden: bool) -> Result<u64, String> {
+    let r = call(&Req::VersionDrop {
+        name: name.into(),
+        golden,
+    })?;
+    r.msg.parse().map_err(|_| {
+        "the iSCSI daemon is of an older build — it is replaced once no machine uses it".to_string()
+    })
 }
 
 /// Close every iSCSI session of client `ip` (that machine is off). Err from a daemon of a build without it.

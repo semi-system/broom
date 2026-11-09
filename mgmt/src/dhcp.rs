@@ -757,6 +757,17 @@ async fn serve(sock: tokio::net::UdpSocket, port: u16, st: SharedState) {
     }
 }
 
+/// The boot file the LAN's own DHCP (a router) must hand UEFI PXE clients when Broom's DHCP server is off: with
+/// "Secure Boot clients" on, the Microsoft-signed iPXE shim (with Secure Boot off it starts iPXE without checking, so
+/// one file can serve the whole room); else our own iPXE build.
+pub(crate) fn router_boot_file(secure_boot_clients: bool) -> &'static str {
+    if secure_boot_clients {
+        "sb/snponly-shim.efi"
+    } else {
+        "snponly.efi"
+    }
+}
+
 /// (Re)start the network boot services: TFTP (:69, iPXE) always, the DHCP server (:67) only when it is on
 /// (`dhcp_mode` = "full"). With the DHCP server off, the LAN's own DHCP (a router) points PXE clients here with
 /// next-server/option 66 + boot file/option 67, and tftp.rs's autoexec.ipxe sends iPXE on to the boot menu.
@@ -830,8 +841,9 @@ pub async fn start(st: &SharedState) -> Result<String, String> {
         )
     } else {
         format!(
-            "DHCP server off — TFTP :69 on {on}: set the LAN's DHCP to next-server {} + boot file snponly.efi (legacy BIOS clients: undionly.kpxe)",
-            cfg.server
+            "DHCP server off — TFTP :69 on {on}: set the LAN's DHCP to next-server {} + boot file {} (legacy BIOS clients: undionly.kpxe)",
+            cfg.server,
+            router_boot_file(cfg.sb)
         )
     })
 }

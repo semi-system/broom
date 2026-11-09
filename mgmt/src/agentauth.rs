@@ -82,6 +82,38 @@ pub(crate) fn key_of(st: &SharedState, mac: &str) -> Option<[u8; 32]> {
     load(st, mac).and_then(|r| unhex32(&r.key))
 }
 
+/// Short fingerprint of a hex key (never the key itself): what a diskless machine's base was built with.
+pub(crate) fn fingerprint_of(key_hex: &str) -> String {
+    unhex32(key_hex).map_or(String::new(), |k| {
+        blake3::hash(&k).to_hex()[..16].to_string()
+    })
+}
+
+/// Diskless machines (diskless.rs): the fingerprint of machine `mac`'s key, made now if it has none. A diskless
+/// machine keeps its key in its base layer, so a new key (or none in the base yet) means its base is built again —
+/// on that first boot `hand_to_base` gives the key to its setup script.
+pub(crate) fn ensure(st: &SharedState, mac: &str) -> Result<String, String> {
+    let k = crate::db::edit_json(&*st.db, &rec_key(mac), |r: &mut Option<KeyRec>| {
+        Ok::<_, String>(r.get_or_insert_with(fresh).key.clone())
+    })??;
+    Ok(fingerprint_of(&k))
+}
+
+/// The fingerprint of machine `mac`'s key, "" when it has none.
+pub(crate) fn fingerprint(st: &SharedState, mac: &str) -> String {
+    load(st, mac).map_or(String::new(), |r| fingerprint_of(&r.key))
+}
+
+/// Diskless machines: the key, hex, for the base layer being built on this first boot (made now if none), marked
+/// delivered. The caller checked the machine (IP + MAC) and that this boot builds its base.
+pub(crate) fn hand_to_base(st: &SharedState, mac: &str) -> Result<String, String> {
+    crate::db::edit_json(&*st.db, &rec_key(mac), |r: &mut Option<KeyRec>| {
+        let rec = r.get_or_insert_with(fresh);
+        rec.delivered = Some(crate::now_secs());
+        Ok::<_, String>(rec.key.clone())
+    })?
+}
+
 /// For the machine's detail (Devices): {made, delivered}.
 pub(crate) fn info(st: &SharedState, mac: &str) -> serde_json::Value {
     load(st, mac).map_or(

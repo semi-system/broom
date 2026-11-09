@@ -12,6 +12,9 @@
     </div>
     <p class="form-text">The zip must contain the <b>extracted</b> driver (<code>.inf</code> + <code>.sys</code> + <code>.cat</code>…), not the vendor's <code>.exe</code> installer
       (extract it first, e.g. open the NVIDIA/AMD installer with 7-Zip). Same name again = replace the package.</p>
+    <p class="form-text mb-0"><b>Network cards</b> (packages marked <span class="badge text-bg-info">network card</span>): <i>Add hardware</i> (Diskless page)
+      also hands every one of them to Windows PE, so a PC whose card Windows PE has no driver for can still report it, and
+      copies the package matching the card into the golden before installing it.</p>
   </div>
   <div class="card card-body mb-3">
     <h2 class="h6 text-uppercase text-body-secondary mb-3">Packages</h2>

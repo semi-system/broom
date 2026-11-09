@@ -110,13 +110,21 @@ fn take_local(mac: &str) -> Option<u8> {
     l.remove(mac).map(|(d, _)| d)
 }
 
-pub async fn render(State(st): State<SharedState>, Query(q): Q) -> impl IntoResponse {
-    let (mac, ip, m) = client(&st, &q);
+pub async fn render(
+    State(st): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Query(q): Q,
+) -> impl IntoResponse {
+    let (mac, ip, mut m) = client(&st, &q);
+    // Legacy BIOS: the Windows stage just handed this machine to its local disk (once) — before anything else.
     if let Some(d) = Some(&mac)
         .filter(|m| !m.is_empty())
         .and_then(|m| take_local(m))
     {
-        let who = m.and_then(|m| m.hostname).unwrap_or_else(|| mac.clone());
+        let who = m
+            .as_ref()
+            .and_then(|m| m.hostname.clone())
+            .unwrap_or_else(|| mac.clone());
         info!(
             "client {who} -> local disk 0x{d:02x} (Windows stage done, legacy BIOS) - mac {mac} - ip {ip}"
         );
@@ -125,6 +133,21 @@ pub async fn render(State(st): State<SharedState>, Query(q): Q) -> impl IntoResp
             "#!ipxe\nsanboot --no-describe --drive 0x{d:02x} || exit\n"
         ));
     }
+    // New machines group on (Groups page): an unknown PC joins it by itself and waits there for an admin.
+    let new_grp = crate::machines::new_group(&st);
+    if m.is_none()
+        && !mac.is_empty()
+        && let Some(g) = new_grp.clone()
+    {
+        let (st2, mac2) = (st.clone(), mac.clone());
+        let peer = peer.ip().to_canonical().to_string();
+        m = tokio::task::spawn_blocking(move || crate::machines::join_new(&st2, &mac2, &peer, &g))
+            .await
+            .unwrap_or_default();
+    }
+    let waiting = m
+        .as_ref()
+        .is_some_and(|m| crate::machines::waiting(m, new_grp.as_deref()));
     let host = m.as_ref().and_then(|m| m.hostname.clone());
     // License generation (a counter, never the key) → stage rebuilds base when it changes.
     let lic = m
@@ -139,16 +162,45 @@ pub async fn render(State(st): State<SharedState>, Query(q): Q) -> impl IntoResp
 
     // Clamp: menu_script does timeout_s * 1000 (would overflow / panic on a huge stored value).
     let timeout_s = crate::db::num(&*st.db, "boot_timeout", 3u64).min(3600);
-    let images = menu_images(st.db.images().unwrap_or_default(), m.as_ref());
+    let mut images = menu_images(st.db.images().unwrap_or_default(), m.as_ref());
+    // Diskless goldens it boots / maintains first; one of them is the default when it has one.
+    if let Some(mm) = m.clone() {
+        let st2 = st.clone();
+        let dl = tokio::task::spawn_blocking(move || crate::diskless::menu_entries(&st2, &mm))
+            .await
+            .unwrap_or_default();
+        if dl.iter().any(|e| e.default) {
+            images.iter_mut().for_each(|i| i.is_default = false);
+        }
+        let dl = dl.into_iter().map(|e| MenuImage {
+            name: e.text,
+            chain: e.chain,
+            is_default: e.default,
+        });
+        images = dl.chain(images).collect();
+    }
+    // A machine waiting in the new-machines group is not "registered" for its disks: they are never partitioned
+    // without asking (the stage asks on its screen), as for an unknown PC — until an admin moves it to its group.
     script(menu_script(
         &images,
         timeout_s,
         host.as_deref(),
         lic,
-        m.is_some(),
+        m.is_some() && !waiting,
         secure_boot(&st),
+        waiting.then_some(WAITING_NOTE),
     ))
 }
+
+/// Top line of the boot menu of a machine waiting in the new-machines group.
+pub(crate) const WAITING_NOTE: &str = "New PC: waiting for an admin to move it to its group";
+
+/// First line before a kernel boot (Windows stage, Capture, Linux images): free every image iPXE still holds. iPXE
+/// hands the kernel ALL its registered images as the initrd, and the autoexec.ipxe script the EFI build loads by itself
+/// (tftp.rs) stays registered: its text then comes first in the initrd → "Initramfs unpacking failed: invalid magic at
+/// start of compressed archive" → kernel panic (seen 4 Nov 2026 on a UEFI client booting the stage). Scripts running
+/// right now are not in the list while they run, so this only drops leftovers.
+pub(crate) const FREE_IMAGES: &str = "imgfree\n";
 
 /// "Secure Boot clients" switch (Network page): clients run the official signed iPXE.
 fn secure_boot(st: &SharedState) -> bool {
@@ -212,6 +264,7 @@ fn menu_images(images: Vec<crate::db::Image>, m: Option<&Machine>) -> Vec<MenuIm
         .into_iter()
         .map(|i| MenuImage {
             is_default: Some(i.id) == def,
+            chain: format!("/boot/start?image={}", i.name),
             name: i.name,
         })
         .collect()
@@ -281,7 +334,7 @@ pub async fn start(
                         .map(|m| m.len())
                 });
             format!(
-                "#!ipxe\nset broom-srv {}\nset broom-base {}\nset broom-strict {}\nset broom-lxgb {}\nset broom-wbgb {WB_GB}\nset broom-ssd {}\nset broom-hide {}\n{}{bs}\n",
+                "#!ipxe\nset broom-srv {}\nset broom-base {}\nset broom-strict {}\nset broom-lxgb {}\nset broom-wbgb {WB_GB}\nset broom-ssd {}\nset broom-hide {}\n{FREE_IMAGES}{}{bs}\n",
                 // The server's address at boot time — boot scripts use ${broom-srv}, so changing the Server IP needs
                 // no republish.
                 st.db.get_config("dhcp_server_ip", ""),
@@ -324,12 +377,102 @@ pub async fn capture(State(st): State<SharedState>, Query(q): Q) -> impl IntoRes
     info!("client {mac} - ip {ip}: Capture (disk -> server) started");
     let srv = st.db.get_config("dhcp_server_ip", "");
     script(format!(
-        "#!ipxe\n{}kernel http://{srv}/tftp/broom-stage/vmlinuz initrd=stage.img ip=${{ip}}::${{gateway}}:${{netmask}}:::off BOOTIF=01-${{mac:hexhyp}} broom.capture=1 broom.srv={srv}\n\
+        "#!ipxe\n{FREE_IMAGES}{}kernel http://{srv}/tftp/broom-stage/vmlinuz initrd=stage.img ip=${{ip}}::${{gateway}}:${{netmask}}:::off BOOTIF=01-${{mac:hexhyp}} broom.capture=1 broom.srv={srv}\n\
          initrd http://{srv}/tftp/broom-stage/stage.img\n\
          boot\n\
          echo Capture could not start\n{back}",
         shim_line(&st, "Capture").unwrap_or_default()
     ))
+}
+
+/// Golden / action names from the query: [a-z0-9-] only (logged and echoed into the script).
+/// `gw` from the query: the router the LAN's DHCP gave iPXE (the menu passes `${net0/gateway}`), IPv4 only.
+fn router(q: &HashMap<String, String>) -> Option<String> {
+    q.get("gw")
+        .and_then(|g| g.trim().parse::<std::net::Ipv4Addr>().ok())
+        .filter(|ip| !ip.is_unspecified())
+        .map(|ip| ip.to_string())
+}
+
+fn word(q: &HashMap<String, String>, k: &str) -> String {
+    q.get(k)
+        .map_or("", String::as_str)
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .take(24)
+        .collect()
+}
+
+/// The menu again after `msg` (a refused or failed diskless / maintenance boot).
+fn back_to_menu(msg: &str) -> String {
+    let msg: String = msg
+        .chars()
+        .filter(|c| c.is_ascii() && *c != '$' && *c != '\n')
+        .collect();
+    format!("#!ipxe\necho {msg}\nsleep 5\nchain /boot.ipxe?mac=${{net0/mac}}&ip=${{net0/ip}}\n")
+}
+
+/// GET /boot/diskless?golden=&mac=&ip= — a registered machine of the golden's groups boots it from the server, no disk.
+pub async fn diskless(
+    State(st): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Query(q): Q,
+) -> impl IntoResponse {
+    let (mac, ip, m) = client(&st, &q);
+    let name = word(&q, "golden");
+    let Some(m) = m else {
+        warn!("client {mac} - ip {ip}: diskless {name}, but not a registered machine");
+        return script(back_to_menu(
+            "Diskless boot needs a registered machine with a fixed IP",
+        ));
+    };
+    let peer = peer.ip().to_canonical().to_string();
+    st.saw_pxe(&mac, Some(&peer));
+    let st2 = st.clone();
+    let gw = router(&q);
+    let r = tokio::task::spawn_blocking(move || {
+        crate::diskless::boot_diskless(&st2, &name, &m, &peer, gw.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    script(match r {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("client {mac} - ip {ip}: diskless boot refused: {e}");
+            back_to_menu(&e)
+        }
+    })
+}
+
+/// GET /boot/maint?golden=&do=install|boot&mac=&ip= — a golden's maintenance machine installs it from its ISO, or boots
+/// it writable.
+pub async fn maint(
+    State(st): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Query(q): Q,
+) -> impl IntoResponse {
+    let (mac, ip, m) = client(&st, &q);
+    let (name, what) = (word(&q, "golden"), word(&q, "do"));
+    let Some(m) = m else {
+        warn!("client {mac} - ip {ip}: maintenance of {name}, but not a registered machine");
+        return script(back_to_menu("Maintenance needs a registered machine"));
+    };
+    let peer = peer.ip().to_canonical().to_string();
+    st.saw_pxe(&mac, Some(&peer));
+    let st2 = st.clone();
+    let gw = router(&q);
+    let r = tokio::task::spawn_blocking(move || {
+        crate::diskless::boot_maint(&st2, &name, &what, &m, &peer, gw.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    script(match r {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("client {mac} - ip {ip}: maintenance boot refused: {e}");
+            back_to_menu(&e)
+        }
+    })
 }
 
 /// GB of the Linux writeback partition (broomwb) on the Broom SSD — the only place this number lives: the stage and
@@ -349,7 +492,10 @@ fn linux_share_gb(golden_sizes: impl Iterator<Item = u64>) -> u64 {
 }
 
 struct MenuImage {
+    /// The text of its line.
     name: String,
+    /// The URL a choice chains to (the client's mac + ip are appended).
+    chain: String,
     is_default: bool,
 }
 
@@ -366,6 +512,7 @@ fn menu_script(
     lic: Option<i64>,
     reg: bool,
     sb: bool,
+    note: Option<&str>,
 ) -> String {
     let mut items = String::new();
     let mut targets = String::new();
@@ -379,10 +526,10 @@ fn menu_script(
             String::new()
         };
         items.push_str(&format!("item {key}{label} [{}] {}\n", i + 1, img.name));
-        // The server logs the boot and returns the image's script (image names are URL-safe: [A-Za-z0-9_-]).
+        // The server logs the boot and returns its script (image / golden names are URL-safe: [A-Za-z0-9_-]).
         targets.push_str(&format!(
-            ":{label}\nchain /boot/start?image={}&mac=${{net0/mac}}&ip=${{net0/ip}} || goto start\n\n",
-            img.name
+            ":{label}\nchain {}&mac=${{net0/mac}}&ip=${{net0/ip}}&gw=${{net0/gateway}} || goto start\n\n",
+            img.chain
         ));
         if img.is_default {
             default = Some(label);
@@ -429,7 +576,7 @@ fn menu_script(
         host
     };
     // One short line per field: the menu box is as wide as its longest line, so this fits any console width.
-    let header = if sb {
+    let mut header = if sb {
         format!(
             "item --gap Host : {host}\nitem --gap IP   : ${{net0/ip}}\nitem --gap MAC  : ${{net0/mac}}\n\
              item --gap\nitem --gap Arrows/number to select, Enter to boot\nitem --gap\n"
@@ -437,6 +584,15 @@ fn menu_script(
     } else {
         String::new()
     };
+    // A line of server text above the choices (plain words only: it is not quoted in the script).
+    if let Some(n) = note {
+        let n: String = n
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || " .,:-()".contains(*c))
+            .take(70)
+            .collect();
+        header = format!("item --gap {n}\nitem --gap\n{header}");
+    }
 
     format!(
         "#!ipxe\n\

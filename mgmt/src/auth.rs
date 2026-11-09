@@ -93,7 +93,7 @@ pub(crate) fn new_user(name: &str, role: Role, v: crate::pwproof::Verifier) -> U
 }
 
 /// What staff may do: read every page (but not the CSV with the license keys, a golden's export or the accounts) and,
-/// of the changes, only Wake, Save / Discard a games update, their own password and logging out. Remote is a GET
+/// of the changes, only Wake / power (turn on, restart, shut down), Save / Discard a games update, their own password and logging out. Remote is a GET
 /// (WebSocket).
 pub(crate) fn staff_may(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
@@ -106,6 +106,10 @@ pub(crate) fn staff_may(method: &axum::http::Method, path: &str) -> bool {
     ];
     const STAFF_POST: &[&str] = &[
         "/api/wake",
+        "/api/power",
+        "/api/vm/start",
+        "/api/vm/stop",
+        "/api/versions/pin",
         "/api/games/save",
         "/api/games/discard",
         "/api/password",
@@ -263,12 +267,14 @@ pub(crate) async fn until_invalid(st: SharedState, tok: Option<String>) {
 }
 
 /// Paths reachable without a session: boot/client endpoints + the login API + the static shell (HTML only, no data).
-fn is_public(method: &axum::http::Method, path: &str) -> bool {
+pub(crate) fn is_public(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
     const OPEN: &[&str] = &[
         "/boot.ipxe",
         "/boot/start",
         "/boot/capture",
+        "/boot/diskless",
+        "/boot/maint",
         "/api/boot/local",
         "/broom-capture",
         "/api/cache-list",
@@ -289,8 +295,25 @@ fn is_public(method: &axum::http::Method, path: &str) -> bool {
         "/api/bench/booted",
         "/broom-prep",
         "/broom-prep-win",
+        "/broom-diskless.ps1",
+        "/broom-diskless.sh",
+        "/api/diskless/client",
+        "/api/diskless/client/base-done",
+        "/api/diskless/client/agent-key",
+        "/boot/onboard",
+        "/api/onboard/report",
+        "/api/onboard/state",
+        "/api/tls/cert",
     ];
-    if OPEN.contains(&path) || path.starts_with("/tftp/") || path.starts_with("/api/auth/") {
+    // /boot/iso/, /boot/nocloud/: a golden's Ubuntu installer, answered to its maintenance machine only (diskless.rs).
+    // /boot/onboard/: "Add hardware" Windows PE files, answered to the job's machine with the job's token (onboard.rs).
+    if OPEN.contains(&path)
+        || path.starts_with("/tftp/")
+        || path.starts_with("/api/auth/")
+        || path.starts_with("/boot/iso/")
+        || path.starts_with("/boot/nocloud/")
+        || path.starts_with("/boot/onboard/")
+    {
         return true;
     }
     // Only the standalone login page (+ its script and stylesheets) is public; the app shell, its tab fragments and all /api/* need a session.

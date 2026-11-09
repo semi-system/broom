@@ -89,6 +89,47 @@ pub fn tar_gz(dir: &Path, out: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", out.display()))
 }
 
+/// The regular files of a tar.gz written by `tar_gz`, as (path, bytes), in archive order (driver packages: a few MB).
+pub fn tar_gz_files(file: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "broom-untar-{}-{}",
+        std::process::id(),
+        crate::auth::random_token()
+    ));
+    let r = (|| {
+        untar_gz(file, &tmp)?;
+        let mut paths = Vec::new();
+        walk(&tmp, &tmp, &mut paths)?;
+        paths.sort();
+        let mut out = Vec::new();
+        for (rel, is_dir) in paths {
+            if !is_dir {
+                let p = tmp.join(&rel);
+                out.push((
+                    rel.replace('\\', "/"),
+                    std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?,
+                ));
+            }
+        }
+        Ok(out)
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    r
+}
+
+/// A plain (uncompressed) ustar archive of `files` (path, bytes) — what Windows PE gets (broom-report.exe reads it;
+/// Windows PE has no tar or gzip of its own).
+pub fn tar(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    for (name, data) in files {
+        header(&mut out, name, 0o644, data.len() as u64, b'0')?;
+        out.extend_from_slice(data);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+    }
+    out.extend_from_slice(&[0u8; 1024]);
+    Ok(out)
+}
+
 /// Extract a tar.gz written by `tar_gz` (ustar + GNU long names; files + directories) into `dest`. Paths must stay
 /// inside `dest` (no absolute paths, no `..`).
 pub fn untar_gz(file: &Path, dest: &Path) -> Result<(), String> {

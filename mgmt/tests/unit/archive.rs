@@ -129,3 +129,23 @@ fn tar_roundtrip_long_names_deterministic() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The plain tar for Windows PE: ustar headers, files padded to 512, long names as GNU `L` entries, two zero blocks.
+#[test]
+fn plain_tar_for_windows_pe() {
+    let long = format!("pkg/{}/x.inf", "d".repeat(120));
+    let t = tar(&[
+        ("pkg/a.inf".to_string(), b"abc".to_vec()),
+        (long.clone(), vec![7u8; 600]),
+    ])
+    .unwrap();
+    assert_eq!(t.len() % 512, 0);
+    assert_eq!(&t[..9], b"pkg/a.inf");
+    assert_eq!(&t[124..135], b"00000000003");
+    assert_eq!(t[156], b'0');
+    assert_eq!(&t[512..515], b"abc");
+    assert_eq!(t[1024 + 156], b'L', "long name entry first");
+    assert!(t.ends_with(&[0u8; 1024]));
+    // header(abc) + data + L header + name block + header + 2 data blocks + end
+    assert_eq!(t.len(), 512 * (2 + 2 + 1 + 2 + 2));
+}

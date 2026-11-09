@@ -38,8 +38,13 @@ fn sh(script: &str) {
 fn capture_then_deploy() {
     sandbox("capture_then_deploy", || {
         let home = Home::new("capture");
-        let _srv = Server::start(&home);
-        let h = admin(&home);
+        // With HTTPS on (the default): the tool trusts the server's self-signed certificate, fetched over HTTP.
+        let _srv = Server::start_with(&home, &["--https-port", "443"]);
+        let cert = Http::new().get("/api/tls/cert").json()["cert"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let h = admin_via(&home, &Http::tls(&cert));
 
         // 64 MiB GPT disk: p1 8 MiB of data, p2 the rest, zeros but one MiB near its end.
         let disk = home.0.join("pc-disk.img");
@@ -58,6 +63,8 @@ fn capture_then_deploy() {
         );
         assert!(text.contains("wrong user or password"), "{text}");
         assert!(text.contains("Image cap1 created"), "{text}");
+        // Over HTTPS (plain HTTP admin calls without the tool's mark are refused while HTTPS is on).
+        assert!(!text.contains("plain HTTP"), "{text}");
         assert!(text.contains("All sent"), "{text}");
         // No Windows on this disk: the server's publish refuses it — after the convert.
         assert!(text.contains("could not publish cap1"), "{text}");
@@ -78,7 +85,9 @@ fn capture_then_deploy() {
 
         // Owner only, and never a mix of two goldens.
         assert_eq!(
-            Http::new().get("/api/images/deploy-map?name=cap1").status,
+            Http::tls(&cert)
+                .get("/api/images/deploy-map?name=cap1")
+                .status,
             401
         );
         assert_eq!(

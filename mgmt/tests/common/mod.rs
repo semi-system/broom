@@ -117,7 +117,12 @@ pub struct Server {
 impl Server {
     /// Start and wait until the web answers.
     pub fn start(home: &Home) -> Server {
-        let s = Server::spawn(home, &[]);
+        Server::start_with(home, &[])
+    }
+
+    /// The same with extra arguments (e.g. `--https-port 443`).
+    pub fn start_with(home: &Home, args: &[&str]) -> Server {
+        let s = Server::spawn(home, args);
         s.wait_up();
         s
     }
@@ -129,8 +134,16 @@ impl Server {
             .append(true)
             .open(home.0.join("server.log"))
             .unwrap();
+        // HTTPS for the web admin off unless a test asks for it: these clients speak plain HTTP (tests/api.rs
+        // https_admin covers HTTPS).
+        let https: &[&str] = if args.contains(&"--https-port") {
+            &[]
+        } else {
+            &["--https-port", "0"]
+        };
         let child = Command::new("ip")
             .args(["netns", "exec", "srv", BIN, "--skip-preflight"])
+            .args(https)
             .args(args)
             .current_dir(&home.0) // old-layout migration looks at the current directory
             .env("BOOTROM_HOME", &home.0)
@@ -153,8 +166,9 @@ impl Server {
     fn wait_up(&self) {
         let t = Instant::now();
         while t.elapsed() < Duration::from_secs(30) {
+            // A public path: with HTTPS on, the sign-in API is on https:// only.
             if std::net::TcpStream::connect((SRV, 80)).is_ok()
-                && Http::new().get("/api/auth/status").status == 200
+                && Http::new().get("/api/tls/cert").status == 200
             {
                 return;
             }
@@ -242,7 +256,10 @@ pub mod pw {
     }
     /// hello → proof: (status of the failing step or 200, the client signed in, the server's proof checked).
     pub fn sign_in(user: &str, pw: &str) -> Result<super::Http, u16> {
-        let mut h = super::Http::new();
+        sign_in_via(super::Http::new(), user, pw)
+    }
+    /// The same through `h` (e.g. an HTTPS client).
+    pub fn sign_in_via(mut h: super::Http, user: &str, pw: &str) -> Result<super::Http, u16> {
         let cnonce =
             hex(&Sha256::digest(format!("{user}{pw}{:?}", std::time::Instant::now()))[..16]);
         let r = h.post(
@@ -284,6 +301,11 @@ pub mod pw {
 
 /// The owner account `admin` made with the setup token from the log (it seals the verifier) → a signed-in client.
 pub fn admin(home: &Home) -> Http {
+    admin_via(home, &Http::new())
+}
+
+/// The same through `base` (e.g. an HTTPS client; its cookie is not used).
+pub fn admin_via(home: &Home, base: &Http) -> Http {
     let log = home.log();
     let token = log
         .lines()
@@ -292,12 +314,12 @@ pub fn admin(home: &Home) -> Http {
         .unwrap_or_else(|| panic!("no setup token in the log:\n{log}"))
         .trim()
         .to_string();
-    let r = Http::new().post(
+    let r = base.fresh().post(
         "/api/auth/setup",
         &serde_json::json!({"user": "admin", "cred": pw::seal(&pw::setup_key(&token), "admin", PASSWORD)}),
     );
     assert_eq!(r.status, 200, "setup: {}", r.text());
-    login()
+    pw::sign_in_via(base.fresh(), "admin", PASSWORD).unwrap_or_else(|s| panic!("login: {s}"))
 }
 
 /// Sign in as admin with PASSWORD (set up earlier).
