@@ -659,9 +659,20 @@ pub(crate) fn reporter_missing() -> Option<String> {
 
 // ---------- the VM side ----------
 
-/// Tools the job needs on this server; Err lists what is missing.
+/// What Add hardware needs on this server (the VM, and open-iscsi + ntfs-3g to write into the golden); Err lists what
+/// is missing.
 pub(crate) fn preflight() -> Result<(), String> {
-    let pkgs = crate::pkgmgr::missing();
+    check(crate::pkgmgr::Feature::Hardware)
+}
+
+/// What the maintenance VM needs (Maintain in the browser): QEMU, OVMF and KVM — its disks come over NBD, from the
+/// daemon, so no open-iscsi.
+pub(crate) fn preflight_vm() -> Result<(), String> {
+    check(crate::pkgmgr::Feature::Vm)
+}
+
+fn check(feature: crate::pkgmgr::Feature) -> Result<(), String> {
+    let pkgs = crate::pkgmgr::missing(feature);
     let mut miss: Vec<String> = pkgs.iter().map(|p| p.what().to_string()).collect();
     if !FsPath::new("/dev/kvm").exists() {
         miss.push("/dev/kvm (KVM; a VM needs nested virtualisation and CPU type host)".into());

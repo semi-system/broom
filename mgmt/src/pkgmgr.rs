@@ -1,6 +1,6 @@
-// pkgmgr.rs — what this server's operating system must provide for the VM features (Add hardware, Maintain in the
-// browser), and installing it from the web admin. Everything else Broom does is built in; only these need programs
-// from the distribution: QEMU/KVM + OVMF (the VM), and until they are built in too, open-iscsi and ntfs-3g.
+// pkgmgr.rs — what this server's operating system must provide for the VM features, and installing it from the web
+// admin. Everything else Broom does is built in; only these need programs from the distribution: QEMU + OVMF (the VM
+// of Maintain in the browser) and, for Add hardware until it is built in too, open-iscsi and ntfs-3g.
 // The page shows the package manager found on the server (apt, dnf, yum), what is missing and the exact command; an
 // owner presses Install and the command runs as this process (root), its output shown live. One install at a time.
 // Another package manager (pacman, zypper, apk…) is named but not driven: package names differ too much to guess.
@@ -110,29 +110,46 @@ pub(crate) fn os_name(os_release: &str) -> String {
         .unwrap_or_default()
 }
 
-/// What of the VM features' requirements is not on the system, from what was found (each a yes / no).
-pub(crate) fn missing_from(qemu: bool, ovmf: bool, iscsiadm: bool, ntfs3g: bool) -> Vec<Pkg> {
-    [
-        (qemu, Pkg::Qemu),
-        (ovmf, Pkg::Ovmf),
-        (iscsiadm, Pkg::Iscsi),
-        (ntfs3g, Pkg::Ntfs3g),
-    ]
-    .into_iter()
-    .filter(|(found, _)| !found)
-    .map(|(_, p)| p)
-    .collect()
+/// A feature that needs programs of the system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Feature {
+    /// Maintain in the browser: the VM.
+    Vm,
+    /// Add hardware: the VM, and (until built in) a way to write into the golden's disk.
+    Hardware,
 }
 
-/// What is missing on this server now.
-pub(crate) fn missing() -> Vec<Pkg> {
+impl Feature {
+    pub(crate) fn needs(self) -> &'static [Pkg] {
+        match self {
+            Feature::Vm => &[Pkg::Qemu, Pkg::Ovmf],
+            Feature::Hardware => &[Pkg::Qemu, Pkg::Ovmf, Pkg::Iscsi, Pkg::Ntfs3g],
+        }
+    }
+
+    pub(crate) fn parse(name: &str) -> Option<Feature> {
+        match name {
+            "vm" => Some(Feature::Vm),
+            "hardware" => Some(Feature::Hardware),
+            _ => None,
+        }
+    }
+}
+
+/// What `f` needs that is not on the system, given which requirements `present` finds.
+pub(crate) fn missing_with(f: Feature, present: impl Fn(Pkg) -> bool) -> Vec<Pkg> {
+    f.needs().iter().copied().filter(|p| !present(*p)).collect()
+}
+
+/// What is missing on this server now for `f`.
+pub(crate) fn missing(f: Feature) -> Vec<Pkg> {
     use crate::onboard::{ovmf, qemu, which};
-    missing_from(
-        qemu().is_some(),
-        ovmf().is_some(),
-        which("iscsiadm").is_some(),
-        which("ntfs-3g").is_some(),
-    )
+    missing_with(f, |p| match p {
+        Pkg::Qemu => qemu().is_some(),
+        Pkg::Ovmf => ovmf().is_some(),
+        Pkg::Iscsi => which("iscsiadm").is_some(),
+        Pkg::Ntfs3g => which("ntfs-3g").is_some(),
+    })
 }
 
 /// The commands that install `missing` with `m`, one after the other: program + arguments of each.
@@ -293,7 +310,7 @@ fn pump(r: impl std::io::Read) {
     }
 }
 
-fn worker(steps: Vec<Vec<String>>) {
+fn worker(steps: Vec<Vec<String>>, feature: Feature) {
     let deadline = Instant::now() + TIMEOUT;
     for s in &steps {
         push_log(format!("$ {}", s.join(" ")));
@@ -302,7 +319,7 @@ fn worker(steps: Vec<Vec<String>>) {
             return finish("failed", e);
         }
     }
-    let left = missing();
+    let left = missing(feature);
     if left.is_empty() {
         tracing::info!("packages: installed");
         finish("done", "installed".into());
@@ -321,8 +338,17 @@ async fn status() -> Result<Json<serde_json::Value>, ApiError> {
     tokio::task::spawn_blocking(|| {
         let has = |p: &str| crate::onboard::which(p).is_some();
         let mgr = detect(has);
-        let miss = missing();
-        let command = mgr.map(|m| command_line(&steps(m, &miss)));
+        let feature = |f: Feature| {
+            let miss = missing(f);
+            serde_json::json!({
+                "missing": miss.iter().map(|p| serde_json::json!({
+                    "what": p.what(),
+                    "package": mgr.map(|m| package(m, *p)),
+                })).collect::<Vec<_>>(),
+                "command": mgr.map(|m| command_line(&steps(m, &miss))),
+                "hint": if mgr.is_none() && !miss.is_empty() { Some(advice(&miss)) } else { None },
+            })
+        };
         let os = std::fs::read_to_string("/etc/os-release")
             .map(|t| os_name(&t))
             .unwrap_or_default();
@@ -331,12 +357,8 @@ async fn status() -> Result<Json<serde_json::Value>, ApiError> {
             "manager": mgr.map(Mgr::name),
             "other": if mgr.is_none() { other_manager(has) } else { None },
             "supported": mgr.is_some(),
-            "missing": miss.iter().map(|p| serde_json::json!({
-                "what": p.what(),
-                "package": mgr.map(|m| package(m, *p)),
-            })).collect::<Vec<_>>(),
-            "command": command,
-            "hint": if mgr.is_none() { Some(advice(&miss)) } else { None },
+            "vm": feature(Feature::Vm),
+            "hardware": feature(Feature::Hardware),
             "kvm": Path::new("/dev/kvm").exists(),
             "job": JOB.lock().clone(),
         })
@@ -346,16 +368,27 @@ async fn status() -> Result<Json<serde_json::Value>, ApiError> {
     .map_err(ise)
 }
 
-/// POST /api/packages/install (owner: a command that runs as root) — installs what is missing.
-async fn install() -> Result<Json<serde_json::Value>, ApiError> {
+#[derive(serde::Deserialize, Default)]
+struct InstallBody {
+    /// vm (default) | hardware: what to install for.
+    #[serde(default)]
+    feature: Option<String>,
+}
+
+/// POST /api/packages/install {feature} (owner: a command that runs as root) — installs what `feature` lacks.
+async fn install(body: Option<Json<InstallBody>>) -> Result<Json<serde_json::Value>, ApiError> {
     if !crate::preflight::is_root() {
         return Err(bad("Broom must run as root to install packages"));
     }
-    let planned = tokio::task::spawn_blocking(|| {
+    let name = body
+        .and_then(|b| b.0.feature)
+        .unwrap_or_else(|| "vm".into());
+    let feature = Feature::parse(&name).ok_or_else(|| bad("feature: vm or hardware"))?;
+    let planned = tokio::task::spawn_blocking(move || {
         let mgr = detect(|p| crate::onboard::which(p).is_some()).ok_or(
             "no apt, dnf or yum on this server: install the packages with its own package manager",
         )?;
-        let miss = missing();
+        let miss = missing(feature);
         let steps = steps(mgr, &miss);
         if steps.is_empty() {
             return Err("nothing is missing");
@@ -381,7 +414,7 @@ async fn install() -> Result<Json<serde_json::Value>, ApiError> {
         });
     }
     tracing::info!("packages: running {}", command_line(&planned));
-    std::thread::spawn(move || worker(planned));
+    std::thread::spawn(move || worker(planned, feature));
     Ok(crate::api::ok())
 }
 

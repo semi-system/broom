@@ -8,6 +8,7 @@
 mod conn;
 pub mod games;
 pub mod golden;
+pub mod nbd;
 pub(crate) mod overlay;
 pub(crate) mod ramimg; // also the Windows goldens' RAM copies (goldenram.rs)
 mod scsi;
@@ -580,6 +581,20 @@ pub async fn run(args: &[String]) -> ! {
             tokio::spawn(control(s));
         }
     });
+    // The VM of this server (vmmaint.rs) reads and writes its disks over a root-only Unix socket: NBD, no iscsiadm.
+    match nbd::listen() {
+        Ok(l) => {
+            tokio::spawn(async move {
+                while let Ok((s, _)) = l.accept().await {
+                    tokio::spawn(nbd::serve(s));
+                }
+            });
+        }
+        Err(e) => tracing::warn!(
+            "iscsid: {}: {e} — the maintenance VM cannot start",
+            nbd::SOCK
+        ),
+    }
     let max = max_conns();
     tracing::info!(
         "iscsid: up to {max} connections, {} commands in flight (sized from this server)",

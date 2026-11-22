@@ -3,8 +3,8 @@ use super::*;
 fn args() -> Vec<String> {
     qemu_args(
         "w11",
-        "/dev/disk/by-path/golden",
-        &[("/dev/disk/by-path/games".into(), "BROOMG1".into())],
+        "iqn.test:w11.g1.u0123456789abcdef",
+        &[("iqn.test:g.g2.u0123456789abcdef".into(), "BROOMG1".into())],
         ("/ovmf/code.fd", "/vm/vars.fd"),
         ("/vm/qmp.sock", "/vm/vnc.sock"),
         (6, 12),
@@ -38,16 +38,22 @@ fn vm_command_line() {
         dev.iter()
             .any(|d| d.starts_with("e1000e,netdev=n0,mac=52:54:00:"))
     );
-    let drives = after(&a, "-drive");
-    assert!(drives.contains(
-        &"file=/dev/disk/by-path/golden,format=raw,if=none,id=d0,cache=none,aio=threads"
-    ));
-    assert!(
-        drives.contains(
-            &"file=/dev/disk/by-path/games,format=raw,if=none,id=g0,cache=none,aio=threads"
-        )
+    // The disks are the daemon's NBD exports on its root-only socket, named like the iSCSI targets of the sessions:
+    // no block device, no file path of the server.
+    let disks = after(&a, "-blockdev");
+    assert_eq!(
+        disks,
+        [
+            "driver=nbd,node-name=d0,server.type=unix,server.path=/run/broom-nbd.sock,export=iqn.test:w11.g1.u0123456789abcdef",
+            "driver=nbd,node-name=g0,server.type=unix,server.path=/run/broom-nbd.sock,export=iqn.test:g.g2.u0123456789abcdef",
+        ]
     );
+    let drives = after(&a, "-drive");
     assert!(drives.contains(&"if=pflash,format=raw,readonly=on,file=/ovmf/code.fd"));
+    assert!(
+        !drives.iter().any(|d| d.contains("/dev/")),
+        "no block device of the server: {drives:?}"
+    );
     assert_eq!(after(&a, "-vnc"), ["unix:/vm/vnc.sock"]);
     assert_eq!(after(&a, "-netdev"), ["user,id=n0"]);
     assert_eq!(after(&a, "-qmp"), ["unix:/vm/qmp.sock,server=on,wait=off"]);

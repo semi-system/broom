@@ -30,18 +30,30 @@ fn os_release_name() {
     assert_eq!(os_name(""), "");
 }
 
-/// What is missing follows what was found, in the order the page lists it.
+/// What is missing follows what was found, in the order the page lists it. The VM needs QEMU and OVMF only (its disks
+/// come over NBD from the daemon); Add hardware also writes into the golden's disk.
 #[test]
 fn missing_follows_what_is_found() {
-    assert!(missing_from(true, true, true, true).is_empty());
+    let found = |list: &'static [Pkg]| move |p: Pkg| list.contains(&p);
+    let all = &[Pkg::Qemu, Pkg::Ovmf, Pkg::Iscsi, Pkg::Ntfs3g];
+    assert!(missing_with(Feature::Hardware, found(all)).is_empty());
     assert_eq!(
-        missing_from(false, true, false, true),
+        missing_with(Feature::Hardware, found(&[Pkg::Ovmf, Pkg::Ntfs3g])),
         vec![Pkg::Qemu, Pkg::Iscsi]
     );
     assert_eq!(
-        missing_from(false, false, false, false),
+        missing_with(Feature::Hardware, found(&[])),
         vec![Pkg::Qemu, Pkg::Ovmf, Pkg::Iscsi, Pkg::Ntfs3g]
     );
+    // The VM without open-iscsi and ntfs-3g is complete.
+    assert!(missing_with(Feature::Vm, found(&[Pkg::Qemu, Pkg::Ovmf])).is_empty());
+    assert_eq!(
+        missing_with(Feature::Vm, found(&[Pkg::Iscsi, Pkg::Ntfs3g])),
+        vec![Pkg::Qemu, Pkg::Ovmf]
+    );
+    assert_eq!(Feature::parse("vm"), Some(Feature::Vm));
+    assert_eq!(Feature::parse("hardware"), Some(Feature::Hardware));
+    assert_eq!(Feature::parse("x"), None);
 }
 
 /// Debian-family names; RHEL-family names (qemu-kvm, edk2-ovmf, iscsi-initiator-utils) for dnf and yum alike.

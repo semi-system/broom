@@ -240,6 +240,17 @@ pub(crate) fn mac_of(golden: &str) -> String {
     format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
 }
 
+/// A disk of the VM: the daemon's NBD export `export` (the target name of the session, with the job's write key) on its
+/// root-only Unix socket — no iscsiadm, no block device on this server. `-blockdev` takes the options the way QEMU's
+/// parser splits them: a comma inside a value is written twice.
+pub(crate) fn nbd_blockdev(node: &str, export: &str) -> String {
+    format!(
+        "driver=nbd,node-name={node},server.type=unix,server.path={},export={}",
+        crate::onboard::qpath(crate::iscsid::nbd::SOCK),
+        crate::onboard::qpath(export)
+    )
+}
+
 /// QEMU's arguments: q35 + UEFI, the golden on AHCI port 0 (Windows has storahci at boot, as in onboard.rs), each games
 /// disk on the next port with its serial, an e1000e (Windows has its driver) on QEMU's NAT, a USB tablet (the
 /// mouse follows the browser's pointer), standard VGA, the screen on a VNC Unix socket, QMP for the power button.
@@ -278,11 +289,8 @@ pub(crate) fn qemu_args(
         // boots real PCs over iSCSI); it stays the golden the PCs boot, with nothing VM-specific installed into it.
         "-device",
         "ahci,id=sata",
-        "-drive",
-        &format!(
-            "file={},format=raw,if=none,id=d0,cache=none,aio=threads",
-            crate::onboard::qpath(disk)
-        ),
+        "-blockdev",
+        &nbd_blockdev("d0", disk),
         "-device",
         "ide-hd,drive=d0,bus=sata.0,bootindex=1",
     ]
@@ -291,11 +299,8 @@ pub(crate) fn qemu_args(
     .collect();
     for (i, (dev, serial)) in games.iter().enumerate() {
         a.extend([
-            "-drive".into(),
-            format!(
-                "file={},format=raw,if=none,id=g{i},cache=none,aio=threads",
-                crate::onboard::qpath(dev)
-            ),
+            "-blockdev".into(),
+            nbd_blockdev(&format!("g{i}"), dev),
             "-device".into(),
             format!("ide-hd,drive=g{i},bus=sata.{},serial={serial}", i + 1),
         ]);
@@ -591,7 +596,7 @@ pub(crate) fn begin(
             s.golden
         ));
     }
-    crate::onboard::preflight()?;
+    crate::onboard::preflight_vm()?;
     // One VM at a time on a server, of either kind.
     if let Some(g) = crate::onboard::running(st) {
         return Err(format!(
@@ -615,32 +620,16 @@ pub(crate) fn begin(
         if !s.games.is_empty() {
             crate::games::sync(st)?;
         }
-        let disk = crate::onboard::login(&s.local(&s.golden_target))?;
-        let mut gdev = Vec::new();
-        for g in &s.games {
-            gdev.push((
-                crate::onboard::login(&s.local(&g.target))?
-                    .to_string_lossy()
-                    .to_string(),
-                g.serial.clone(),
-            ));
-        }
-        // Writable, or Windows would fail on its first write: the daemon must have taken this server as the writer.
-        if !crate::diskless::served(&s.golden).is_some_and(|i| i.disk.update_connected) {
-            return Err(format!("{}: the server did not get it writable", s.golden));
-        }
-        let st_games = crate::iscsi::games_status().unwrap_or_default();
-        for g in &s.games {
-            if !st_games
-                .iter()
-                .any(|x| x.name == g.name && x.update_connected)
-            {
-                return Err(format!(
-                    "games disk {}: the server did not get it writable",
-                    g.name
-                ));
-            }
-        }
+        nbd_ready()?;
+        // The VM's disks are NBD exports of the daemon, named like the iSCSI targets of the same sessions (with the
+        // job's write key: the daemon refuses a keyed name it cannot give the update session, so QEMU does not start
+        // on a disk it could not write).
+        let disk = s.local(&s.golden_target);
+        let gdev: Vec<(String, String)> = s
+            .games
+            .iter()
+            .map(|g| (s.local(&g.target), g.serial.clone()))
+            .collect();
         let work = work_dir(st, &s.golden)?;
         let (code, vars_t) = crate::onboard::ovmf().ok_or("no OVMF")?;
         let vars = work.join("vars.fd");
@@ -652,7 +641,7 @@ pub(crate) fn begin(
         let _ = std::fs::remove_file(&vnc_s);
         let mut args = qemu_args(
             &s.golden,
-            &disk.to_string_lossy(),
+            &disk,
             &gdev,
             (&code.to_string_lossy(), &vars.to_string_lossy()),
             (&qmp_s.to_string_lossy(), &vnc_s.to_string_lossy()),
@@ -670,6 +659,22 @@ pub(crate) fn begin(
                 ));
             }
             std::thread::sleep(Duration::from_millis(200));
+        }
+        // Writable, or Windows would fail on its first write: the daemon must have taken this server as the writer.
+        if !crate::diskless::served(&s.golden).is_some_and(|i| i.disk.update_connected) {
+            return Err(format!("{}: the server did not get it writable", s.golden));
+        }
+        let st_games = crate::iscsi::games_status().unwrap_or_default();
+        for g in &s.games {
+            if !st_games
+                .iter()
+                .any(|x| x.name == g.name && x.update_connected)
+            {
+                return Err(format!(
+                    "games disk {}: the server did not get it writable",
+                    g.name
+                ));
+            }
         }
         Ok(pid)
     })();
@@ -726,6 +731,49 @@ fn stop_qemu(s: &Session) {
     }
 }
 
+/// The daemon listens for NBD (an older daemon, started by a previous build, does not): replaced at once when no
+/// machine is connected to it. Err = what to do. Blocking.
+fn nbd_ready() -> Result<(), String> {
+    let up = || Path::new(crate::iscsid::nbd::SOCK).exists();
+    if !up() {
+        crate::iscsi::upgrade_if_idle();
+        for _ in 0..50 {
+            if up() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    if up() {
+        Ok(())
+    } else {
+        Err("the iSCSI daemon is of an older build, without the VM's disk socket: it is replaced when no machine is \
+             connected to it — try again then"
+            .into())
+    }
+}
+
+/// The disks of a stopped VM are closed in the daemon: its sessions end when QEMU's connections do, a moment after
+/// QEMU is gone, and what they wrote is flushed then. Saving or discarding must not run before. Blocking.
+fn wait_detached(s: &Session) {
+    for _ in 0..100 {
+        let golden = crate::diskless::served(&s.golden).is_some_and(|i| i.disk.update_connected);
+        let games = crate::iscsi::games_status().unwrap_or_default();
+        let games = s
+            .games
+            .iter()
+            .any(|g| games.iter().any(|x| x.name == g.name && x.update_connected));
+        if !golden && !games {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    tracing::warn!(
+        "vm: {}: the daemon still shows a session of the VM after 20 s",
+        s.golden
+    );
+}
+
 /// The VM is gone: disks handed back, the golden's changes discarded unless kept, outcome recorded. Blocking.
 fn finish(st: &SharedState, why: Option<String>) {
     let _l = LOCK.lock();
@@ -733,10 +781,7 @@ fn finish(st: &SharedState, why: Option<String>) {
         *OWNS.lock() = None;
         return;
     };
-    for g in &s.games {
-        crate::onboard::logout(&s.local(&g.target));
-    }
-    crate::onboard::logout(&s.local(&s.golden_target));
+    wait_detached(&s);
     *OWNS.lock() = None;
     let _ = crate::diskless::sync(st);
     if !s.games.is_empty() {
@@ -855,7 +900,7 @@ async fn status(State(st): State<SharedState>) -> Json<serde_json::Value> {
     let (games_st, problem) = tokio::task::spawn_blocking(|| {
         (
             crate::iscsi::games_status().unwrap_or_default(),
-            crate::onboard::preflight().err(),
+            crate::onboard::preflight_vm().err(),
         )
     })
     .await

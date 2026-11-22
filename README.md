@@ -264,7 +264,7 @@ PC down.
   network is left open on purpose (internet, and the LANs the server reaches). One VM at a time on the server —
   this one or Add hardware's — and it is started only when its memory and 1 GB to spare are free; the golden needs
   no maintenance machine. Needs
-  QEMU, OVMF, `open-iscsi` and KVM, as Add hardware (the Diskless page shows what is missing and an owner installs it
+  QEMU, OVMF and KVM only: its disks are served to QEMU by Broom's own iSCSI daemon over a root-only Unix socket (NBD), so no `open-iscsi` and no kernel iSCSI initiator (the Diskless page shows what is missing and an owner installs it
   with **Install**: it detects apt, dnf or yum and runs the command as root) — so the server is either a physical machine
   with virtualization (Intel VT-x / AMD-V) turned on in its BIOS, or a VM on a host that hands virtualization down
   to it (nested virtualization on, CPU type *host*); without `/dev/kvm` the page says so and no VM starts. In the VM, Steam and other sign-ins are lost with

@@ -819,18 +819,20 @@ async function loadDiskless(){
   const m=document.getElementById('dl_msg');if(m)say(m,d.error?' ✗ not served: '+d.error:'');
   loadPackages().catch(()=>{});loadOnboard().catch(()=>{});loadVm().catch(()=>{});}
 // "Server packages" (pkgmgr.rs): what the VM features need from the operating system, and the owner's Install.
-let pkTimer=null,pkCmd='',pkWas=false;
+let pkTimer=null,pkCmd={},pkWas=false;
 async function loadPackages(){
   const r=await j('/api/packages').catch(()=>null);const st=document.getElementById('pk_state');if(!r||!st)return;
-  const run=!!r.job&&r.job.state==='running',miss=r.missing||[];
+  const run=!!r.job&&r.job.state==='running';
   document.getElementById('pk_os').textContent=(r.os?r.os+'. ':'')+'Package manager: '+(r.manager||r.other&&r.other+' (not driven by Broom)'||'none found')+'.';
-  let h=miss.length?'Missing: '+miss.map(m=>esc(m.what)+(m.package?' <span class="mono">('+esc(m.package)+')</span>':'')).join(', ')
-    :'<span class="text-success">✓ QEMU, OVMF and the other programs are installed.</span>';
-  if(miss.length&&r.supported)h+='<div class="mono mt-1">'+esc(r.command)+'</div>';
-  if(miss.length&&!r.supported)h+='<div class="text-danger mt-1">'+esc(r.hint||'')+'</div>';
-  if(!r.kvm)h+='<div class="text-danger mt-1">/dev/kvm is missing: a VM needs KVM (turn on virtualisation in the firmware, or nested virtualisation when this server is itself a VM).</div>';
-  st.innerHTML=h;pkCmd=r.command||'';
-  const b=document.getElementById('pk_btn');b.hidden=!(r.supported&&miss.length);b.disabled=run;
+  // One block per feature: what it lacks, the command, and the owner's Install for it.
+  const row=(key,title,f)=>{const miss=f.missing||[];pkCmd[key]=f.command||'';
+    if(!miss.length)return `<div class="mb-2"><b>${esc(title)}:</b> <span class="text-success">✓ everything it needs is installed.</span></div>`;
+    return `<div class="mb-2"><b>${esc(title)}:</b> missing ${esc(miss.map(m=>m.what+(m.package?' ('+m.package+')':'')).join(', '))}`
+      +(r.supported?`<div class="mono mt-1">${esc(f.command)}</div><button class="btn btn-sm btn-primary mt-1" data-owner ${act('pkInstall',key)}${run?' disabled':''}>Install</button>`
+        :`<div class="text-danger mt-1">${esc(f.hint||'')}</div>`)+'</div>';};
+  let h=row('vm','Maintain in the browser',r.vm)+row('hardware','Add hardware',r.hardware);
+  if(!r.kvm)h+='<div class="text-danger">/dev/kvm is missing: a VM needs KVM (turn on virtualisation in the firmware, or nested virtualisation when this server is itself a VM).</div>';
+  st.innerHTML=h;
   const lg=document.getElementById('pk_log'),jb=r.job;
   lg.hidden=!jb;
   if(jb){lg.textContent=(jb.log||[]).join('\n')+(jb.state==='failed'?'\n✗ '+jb.msg:jb.state==='done'?'\n✓ '+jb.msg:'');lg.scrollTop=lg.scrollHeight;}
@@ -840,9 +842,9 @@ async function loadPackages(){
   if(pkWas&&!run)loadVm().catch(()=>{});
   pkWas=run;
 }
-async function pkInstall(){
-  if(!await sure('Run on this server, as root:\n\n'+pkCmd+'\n\nIt can take several minutes.'))return;
-  try{await j('/api/packages/install',mk({}));}catch(e){toast(e.message,true);}
+async function pkInstall(feature){
+  if(!await sure('Run on this server, as root:\n\n'+(pkCmd[feature]||'')+'\n\nIt can take several minutes.'))return;
+  try{await j('/api/packages/install',mk({feature}));}catch(e){toast(e.message,true);}
   loadPackages().catch(()=>{});
 }
 // "Add hardware": a new PC's network card installed into a Windows golden (onboard.rs).
