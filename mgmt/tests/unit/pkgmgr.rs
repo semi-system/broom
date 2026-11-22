@@ -31,14 +31,27 @@ fn os_release_name() {
 }
 
 /// What is missing follows what was found, in the order the page lists it. The VM of both features needs QEMU and OVMF
-/// only: its disk comes over NBD from the daemon, and Add hardware's job over HTTP.
+/// only (its disk comes over NBD from the daemon, and Add hardware's job over HTTP); xfsprogs is a need of its own.
 #[test]
 fn missing_follows_what_is_found() {
     let found = |list: &'static [Pkg]| move |p: Pkg| list.contains(&p);
-    assert!(missing_with(found(&[Pkg::Qemu, Pkg::Ovmf])).is_empty());
-    assert_eq!(missing_with(found(&[Pkg::Ovmf])), vec![Pkg::Qemu]);
-    assert_eq!(missing_with(found(&[Pkg::Qemu])), vec![Pkg::Ovmf]);
-    assert_eq!(missing_with(found(&[])), vec![Pkg::Qemu, Pkg::Ovmf]);
+    let vm = Feature::Vm;
+    assert!(missing_with(vm, found(&[Pkg::Qemu, Pkg::Ovmf])).is_empty());
+    assert_eq!(
+        missing_with(vm, found(&[Pkg::Ovmf, Pkg::Xfs])),
+        vec![Pkg::Qemu]
+    );
+    assert_eq!(missing_with(vm, found(&[Pkg::Qemu])), vec![Pkg::Ovmf]);
+    assert_eq!(missing_with(vm, found(&[])), vec![Pkg::Qemu, Pkg::Ovmf]);
+    assert!(missing_with(Feature::Xfs, found(&[Pkg::Xfs])).is_empty());
+    assert_eq!(
+        missing_with(Feature::Xfs, found(&[Pkg::Qemu, Pkg::Ovmf])),
+        vec![Pkg::Xfs],
+        "the VM's programs do not stand in for it"
+    );
+    assert_eq!(Feature::parse("vm"), Some(Feature::Vm));
+    assert_eq!(Feature::parse("xfs"), Some(Feature::Xfs));
+    assert_eq!(Feature::parse("hardware"), None);
 }
 
 /// Debian-family names; RHEL-family names (qemu-kvm, edk2-ovmf, iscsi-initiator-utils) for dnf and yum alike.
@@ -46,9 +59,11 @@ fn missing_follows_what_is_found() {
 fn package_names() {
     assert_eq!(package(Mgr::Apt, Pkg::Qemu), "qemu-system-x86");
     assert_eq!(package(Mgr::Apt, Pkg::Ovmf), "ovmf");
+    assert_eq!(package(Mgr::Apt, Pkg::Xfs), "xfsprogs");
     for m in [Mgr::Dnf, Mgr::Yum] {
         assert_eq!(package(m, Pkg::Qemu), "qemu-kvm");
         assert_eq!(package(m, Pkg::Ovmf), "edk2-ovmf");
+        assert_eq!(package(m, Pkg::Xfs), "xfsprogs");
     }
 }
 
@@ -71,6 +86,10 @@ fn install_commands() {
     assert_eq!(
         command_line(&steps(Mgr::Yum, &[Pkg::Ovmf])),
         "yum install -y edk2-ovmf"
+    );
+    assert_eq!(
+        command_line(&steps(Mgr::Apt, &[Pkg::Xfs])),
+        "apt-get update && apt-get install -y xfsprogs"
     );
     assert!(steps(Mgr::Apt, &[]).is_empty());
     assert_eq!(command_line(&[]), "");

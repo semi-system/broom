@@ -674,7 +674,7 @@ pub(crate) fn reporter_missing() -> Option<String> {
 /// disk comes over NBD from Broom's own daemon and Add hardware's job over HTTP: no open-iscsi, no ntfs-3g. Err lists
 /// what is missing.
 pub(crate) fn preflight() -> Result<(), String> {
-    let pkgs = crate::pkgmgr::missing();
+    let pkgs = crate::pkgmgr::missing(crate::pkgmgr::Feature::Vm);
     let mut miss: Vec<String> = pkgs.iter().map(|p| p.what().to_string()).collect();
     if !FsPath::new("/dev/kvm").exists() {
         miss.push("/dev/kvm (KVM; a VM needs nested virtualisation and CPU type host)".into());

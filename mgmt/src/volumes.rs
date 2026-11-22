@@ -752,7 +752,9 @@ async fn format_disk(
         .await
         .map_err(ise)?
         .map_err(bad)?;
-    Ok(Json(serde_json::json!({"ok": true, "id": v.id})))
+    Ok(Json(
+        serde_json::json!({"ok": true, "id": v.id, "fstype": v.fstype}),
+    ))
 }
 
 #[derive(Deserialize)]

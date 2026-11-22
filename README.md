@@ -74,7 +74,8 @@ their own layer over it. Every boot resets to `base ← drivers ← fresh child`
     runs the command as root). The VM's disk comes from Broom's own daemon over a Unix socket and *Add hardware*'s job
     over HTTP, so no `open-iscsi` and no `ntfs-3g`.
   - **Formatting a server disk** (*Server → Disks*): `mkfs.xfs` (package `xfsprogs`) for XFS with reflink; without it
-    the disk is formatted ext4, where versions do not share their data.
+    the disk is formatted ext4, where versions do not share their data. The Server packages card on the Diskless page
+    installs it too, and the format result says when a disk came out ext4.
 
   `install-service` needs systemd. Where systemd is there, the iSCSI daemon and the VM run as its transient units;
   without it they start as plain processes and the binary runs in the foreground.
