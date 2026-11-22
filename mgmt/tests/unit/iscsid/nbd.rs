@@ -364,3 +364,144 @@ async fn legacy_export_name_and_unknown_options() {
     assert!(rest.is_empty());
     let _ = std::fs::remove_file(&p);
 }
+
+/// A QEMU tool on the daemon's NBD socket: `tool pre… <image options> post…`, stdout + stderr back.
+fn qemu_tool(
+    tool: &str,
+    sock: &std::path::Path,
+    export: &str,
+    pre: &[String],
+    post: &[String],
+) -> (bool, String) {
+    let opts = format!(
+        "driver=nbd,server.type=unix,server.path={},export={export}",
+        sock.display()
+    );
+    let o = std::process::Command::new(tool)
+        .args(pre)
+        .arg("--image-opts")
+        .arg(&opts)
+        .args(post)
+        .output()
+        .expect(tool);
+    (
+        o.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+    )
+}
+
+/// Live (needs qemu-io and qemu-img): QEMU's own NBD client against this server on a Unix socket, the way the VM
+/// connects. The size is seen, the whole disk reads back byte for byte, a keyed session writes (with FUA and a flush)
+/// and a later session of the same key reads what was written, while the plain name reads the disk and is refused a
+/// write, and a wrong key is refused outright.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn live_qemu_client() {
+    let _one = crate::iscsid::golden::TEST_LOCK.lock().await;
+    let d = std::env::temp_dir().join(format!("broom_test_nbd_live_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let img = d.join("k/games.img");
+    std::fs::create_dir_all(img.parent().unwrap()).unwrap();
+    let base = patterned(1 << 20);
+    std::fs::write(&img, &base).unwrap();
+    let key = "0123456789abcdef0123456789abcdef";
+    games::set(vec![games::Config {
+        name: "k".into(),
+        iqn: "iqn.test:nbdlive".into(),
+        path: img.to_string_lossy().into(),
+        update_ip: Some("127.0.0.1".into()),
+        update_key: Some(key.into()),
+        ..Default::default()
+    }])
+    .unwrap();
+    let sock = d.join("nbd.sock");
+    let l = tokio::net::UnixListener::bind(&sock).unwrap();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = l.accept().await {
+            tokio::spawn(serve(s));
+        }
+    });
+    let plain = "iqn.test:nbdlive.g0".to_string();
+    let keyed = format!("{plain}.u{key}");
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let run = |tool: &'static str, export: &str, pre: Vec<String>, post: Vec<String>| {
+        let (sock, export) = (sock.clone(), export.to_string());
+        async move {
+            tokio::task::spawn_blocking(move || qemu_tool(tool, &sock, &export, &pre, &post))
+                .await
+                .unwrap()
+        }
+    };
+
+    // The size, as QEMU sees it.
+    let (ok, out) = run("qemu-img", &plain, s(&["info", "--output=json"]), vec![]).await;
+    assert!(ok, "{out}");
+    assert!(out.contains("\"virtual-size\": 1048576"), "{out}");
+
+    // The whole disk, byte for byte.
+    let copy = d.join("copy.raw");
+    let dest = vec![copy.to_string_lossy().into_owned()];
+    let (ok, out) = run("qemu-img", &plain, s(&["convert", "-O", "raw"]), dest).await;
+    assert!(ok, "{out}");
+    assert!(
+        std::fs::read(&copy).unwrap() == base,
+        "the copy differs from the disk"
+    );
+
+    // The plain name is read-only: a write fails, a read works.
+    let (ok, out) = run(
+        "qemu-io",
+        &plain,
+        s(&["-c", "write -P 0x11 0 4096"]),
+        vec![],
+    )
+    .await;
+    // QEMU opens the export read-write by default and the server says it is read-only: the open itself is refused.
+    assert!(!ok, "a write to the plain name must fail: {out}");
+    let (ok, out) = run("qemu-io", &plain, s(&["-r", "-c", "read 0 4096"]), vec![]).await;
+    assert!(ok && out.contains("read 4096/4096 bytes"), "{out}");
+
+    // The keyed name writes: 8 KB of 0xab at 4096, FUA, then a flush.
+    let (ok, out) = run(
+        "qemu-io",
+        &keyed,
+        s(&["-c", "write -f -P 0xab 4096 8192", "-c", "flush"]),
+        vec![],
+    )
+    .await;
+    assert!(ok && out.contains("wrote 8192/8192 bytes"), "{out}");
+    // A new session of the same key reads its own earlier writes (the pattern is checked by qemu-io), and the disk
+    // around them is untouched.
+    let (ok, out) = run(
+        "qemu-io",
+        &keyed,
+        s(&["-c", "read -P 0xab 4096 8192"]),
+        vec![],
+    )
+    .await;
+    assert!(ok && out.contains("read 8192/8192 bytes"), "{out}");
+    let (ok, out) = run("qemu-io", &keyed, s(&["-c", "read -v 0 16"]), vec![]).await;
+    assert!(ok, "{out}");
+    let want: Vec<String> = base[..16].iter().map(|b| format!("{b:02x}")).collect();
+    assert!(out.contains(&want.join(" ")), "{out}");
+    // A wrong key is refused outright.
+    let (ok, out) = run(
+        "qemu-io",
+        &format!("{plain}.u{}", "f".repeat(32)),
+        s(&["-c", "write -P 0x22 0 512"]),
+        vec![],
+    )
+    .await;
+    assert!(!ok, "a wrong key must not write: {out}");
+    assert!(
+        out.contains("not writable"),
+        "the reason reaches the client: {out}"
+    );
+
+    games::set(Vec::new()).unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
