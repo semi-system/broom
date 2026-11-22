@@ -661,26 +661,21 @@ pub(crate) fn reporter_missing() -> Option<String> {
 
 /// Tools the job needs on this server; Err lists what is missing.
 pub(crate) fn preflight() -> Result<(), String> {
-    let mut miss = Vec::new();
-    for t in ["qemu-system-x86_64", "iscsiadm", "ntfs-3g"] {
-        if which(t).is_none() {
-            miss.push(t.to_string());
-        }
-    }
-    if ovmf().is_none() {
-        miss.push("OVMF (UEFI firmware for QEMU)".into());
-    }
+    let pkgs = crate::pkgmgr::missing();
+    let mut miss: Vec<String> = pkgs.iter().map(|p| p.what().to_string()).collect();
     if !FsPath::new("/dev/kvm").exists() {
         miss.push("/dev/kvm (KVM; a VM needs nested virtualisation and CPU type host)".into());
     }
     if miss.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "this server lacks {} — on Debian/Ubuntu: apt install qemu-system-x86 ovmf open-iscsi ntfs-3g",
-            miss.join(", ")
-        ))
+        return Ok(());
     }
+    // What a person can do about the missing programs (the Install button, or the command); /dev/kvm is not one.
+    let fix = if pkgs.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", crate::pkgmgr::advice(&pkgs))
+    };
+    Err(format!("this server lacks {}{fix}", miss.join(", ")))
 }
 
 // ---------- confining QEMU ----------
@@ -708,10 +703,7 @@ pub(crate) fn parse_qemu_version(text: &str) -> Option<(u32, u32)> {
 
 /// The installed QEMU's version (None = not found / not understood).
 pub(crate) fn qemu_version() -> Option<(u32, u32)> {
-    let o = Command::new(which("qemu-system-x86_64")?)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let o = Command::new(qemu()?).arg("--version").output().ok()?;
     parse_qemu_version(&String::from_utf8_lossy(&o.stdout))
 }
 
@@ -738,6 +730,14 @@ pub(crate) fn confine_args(version: Option<(u32, u32)>) -> Vec<String> {
         "on,obsolete=deny,elevateprivileges=allow,spawn=deny,resourcecontrol=deny".to_string(),
     ]);
     a
+}
+
+/// QEMU: `qemu-system-x86_64`, or `qemu-kvm` where the distribution (RHEL and its kin) puts it in libexec.
+pub(crate) fn qemu() -> Option<PathBuf> {
+    which("qemu-system-x86_64").or_else(|| {
+        let p = PathBuf::from("/usr/libexec/qemu-kvm");
+        p.is_file().then_some(p)
+    })
 }
 
 pub(crate) fn which(t: &str) -> Option<PathBuf> {
@@ -1125,7 +1125,7 @@ fn run_vm(st: &SharedState, token: &str, disk: &FsPath, work: &FsPath) -> Result
     );
     args.extend(confine_args(qemu_version()));
     let log = std::fs::File::create(work.join("qemu.log")).map_err(|e| e.to_string())?;
-    let mut c = Command::new(which("qemu-system-x86_64").ok_or("no qemu-system-x86_64")?)
+    let mut c = Command::new(qemu().ok_or("no qemu-system-x86_64")?)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(log.try_clone().map_err(|e| e.to_string())?)

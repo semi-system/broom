@@ -46,6 +46,7 @@ mod ntfsread;
 mod onboard;
 mod overlay;
 mod pins;
+mod pkgmgr;
 mod power;
 mod preflight;
 mod publish;
@@ -607,6 +608,7 @@ async fn main() {
         .merge(settings::routes()) // boot menu, zram, DHCP, guest user
         .merge(devices::routes()) // Devices page: edit / bulk / CSV / detail
         .merge(monitor::routes()) // online status, Wake-on-LAN
+        .merge(pkgmgr::routes()) // which packages the VM features need, and installing them (Diskless page)
         .merge(power::routes()) // turn on / restart / shut down machines (Machines page)
         .merge(inventory::routes()) // each machine's hardware list (Machines page)
         .merge(display::routes()) // resolution + refresh per machine / group (Machines page)

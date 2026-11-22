@@ -264,7 +264,8 @@ PC down.
   network is left open on purpose (internet, and the LANs the server reaches). One VM at a time on the server —
   this one or Add hardware's — and it is started only when its memory and 1 GB to spare are free; the golden needs
   no maintenance machine. Needs
-  `qemu-system-x86`, `ovmf`, `open-iscsi` and KVM, as Add hardware — so the server is either a physical machine
+  QEMU, OVMF, `open-iscsi` and KVM, as Add hardware (the Diskless page shows what is missing and an owner installs it
+  with **Install**: it detects apt, dnf or yum and runs the command as root) — so the server is either a physical machine
   with virtualization (Intel VT-x / AMD-V) turned on in its BIOS, or a VM on a host that hands virtualization down
   to it (nested virtualization on, CPU type *host*); without `/dev/kvm` the page says so and no VM starts. In the VM, Steam and other sign-ins are lost with
   the Windows changes unless they are kept.
@@ -284,7 +285,7 @@ PC down.
   `broom-onboard.ps1`, run by the golden's own startup task, creates each card's device with that instance ID and lets
   Windows install the best driver from its driver store, marked as a network-boot driver; then Broom saves the golden's
   next version and the PC restarts into it. Identical PCs need it once; a PC whose cards are all known finishes at
-  once. Needs on the server: `qemu-system-x86_64`, OVMF, `iscsiadm` (open-iscsi), `ntfs-3g` and `/dev/kvm`: a
+  once. Needs on the server: `qemu-system-x86_64` (or `qemu-kvm`), OVMF, `iscsiadm` (open-iscsi), `ntfs-3g` and `/dev/kvm` (the Diskless page lists what is missing, with an **Install** button for owners): a
   physical server with virtualization (Intel VT-x / AMD-V) turned on in its BIOS, or — when Broom itself runs in a
   VM — a host with nested virtualization on and CPU type *host* for that VM. The card needs a driver in Windows PE (to report) and in the
   golden (to install). **Network-card drivers from the library** (Drivers page; packages whose .inf is Class=Net are

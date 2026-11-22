@@ -817,7 +817,34 @@ async function loadDiskless(){
   const sc=document.getElementById('dl_scriptcmd');if(sc)sc.textContent='irm http://'+srv+'/broom-diskless.ps1 | iex';
   const sh=document.getElementById('dl_scriptcmd_sh');if(sh)sh.textContent='curl -fsS http://'+srv+'/broom-diskless.sh | sudo sh';
   const m=document.getElementById('dl_msg');if(m)say(m,d.error?' ✗ not served: '+d.error:'');
-  loadOnboard().catch(()=>{});loadVm().catch(()=>{});}
+  loadPackages().catch(()=>{});loadOnboard().catch(()=>{});loadVm().catch(()=>{});}
+// "Server packages" (pkgmgr.rs): what the VM features need from the operating system, and the owner's Install.
+let pkTimer=null,pkCmd='',pkWas=false;
+async function loadPackages(){
+  const r=await j('/api/packages').catch(()=>null);const st=document.getElementById('pk_state');if(!r||!st)return;
+  const run=!!r.job&&r.job.state==='running',miss=r.missing||[];
+  document.getElementById('pk_os').textContent=(r.os?r.os+'. ':'')+'Package manager: '+(r.manager||r.other&&r.other+' (not driven by Broom)'||'none found')+'.';
+  let h=miss.length?'Missing: '+miss.map(m=>esc(m.what)+(m.package?' <span class="mono">('+esc(m.package)+')</span>':'')).join(', ')
+    :'<span class="text-success">✓ QEMU, OVMF and the other programs are installed.</span>';
+  if(miss.length&&r.supported)h+='<div class="mono mt-1">'+esc(r.command)+'</div>';
+  if(miss.length&&!r.supported)h+='<div class="text-danger mt-1">'+esc(r.hint||'')+'</div>';
+  if(!r.kvm)h+='<div class="text-danger mt-1">/dev/kvm is missing: a VM needs KVM (turn on virtualisation in the firmware, or nested virtualisation when this server is itself a VM).</div>';
+  st.innerHTML=h;pkCmd=r.command||'';
+  const b=document.getElementById('pk_btn');b.hidden=!(r.supported&&miss.length);b.disabled=run;
+  const lg=document.getElementById('pk_log'),jb=r.job;
+  lg.hidden=!jb;
+  if(jb){lg.textContent=(jb.log||[]).join('\n')+(jb.state==='failed'?'\n✗ '+jb.msg:jb.state==='done'?'\n✓ '+jb.msg:'');lg.scrollTop=lg.scrollHeight;}
+  clearTimeout(pkTimer);
+  if(run&&pageFromPath()==='diskless')pkTimer=setTimeout(()=>loadPackages().catch(()=>{}),2000);
+  // The VM cards say what was missing: refresh them once an install has ended.
+  if(pkWas&&!run)loadVm().catch(()=>{});
+  pkWas=run;
+}
+async function pkInstall(){
+  if(!await sure('Run on this server, as root:\n\n'+pkCmd+'\n\nIt can take several minutes.'))return;
+  try{await j('/api/packages/install',mk({}));}catch(e){toast(e.message,true);}
+  loadPackages().catch(()=>{});
+}
 // "Add hardware": a new PC's network card installed into a Windows golden (onboard.rs).
 let obTimer=null;
 async function loadOnboard(){

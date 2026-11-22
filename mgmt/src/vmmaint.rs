@@ -385,7 +385,7 @@ pub(crate) fn unit_limits(work: &Path) -> Vec<String> {
 /// Start QEMU outside bootrom-mgmt.service (whose restart kills its cgroup): its own unit, or its own session.
 /// → Some(pid) without systemd.
 fn launch(golden: &str, args: &[String], log: &Path) -> Result<Option<u32>, String> {
-    let qemu = crate::onboard::which("qemu-system-x86_64").ok_or("no qemu-system-x86_64")?;
+    let qemu = crate::onboard::qemu().ok_or("no qemu-system-x86_64")?;
     if systemd() {
         let u = unit(golden);
         let _ = Command::new("systemctl")
