@@ -1,42 +1,64 @@
 # broom-onboard.ps1 - "Add hardware": runs ONLY inside Broom's onboarding VM, never on a client.
-# Broom boots the golden in a small VM on the server with this file in place of broom-diskless.ps1 (the golden's
-# BroomDiskless startup task runs it as SYSTEM) and the job next to it (broom-onboard.json: the network cards a new PC
-# reported from Windows PE - their device instance IDs, hardware IDs, compatible IDs).
+# Broom boots the golden in a small VM on the server. The golden's BroomDiskless startup task (broom-diskless.ps1)
+# fetches the server's current script at every start; to the VM of a running job the server answers with THIS file, with
+# its own address and the job's token filled in. So nothing is written into the golden by the server, and the golden
+# needs no change for it: the job (the network cards a new PC reported from Windows PE - their device instance IDs,
+# hardware IDs, compatible IDs) and the library's driver packages are fetched here over HTTP, and the result is posted
+# back (POST /api/onboard/result).
 # For each card it does what Windows Plug and Play does when it meets that card on that PC: it creates the device with
 # exactly that instance ID and installs the best driver for it from the driver store; the card's driver is marked as a
-# network-boot driver (BootFlags) so Windows loads it when it boots from the network. Then it writes
-# broom-onboard-result.json and powers the VM off. Broom then puts the original broom-diskless.ps1 back and saves the
-# golden's next version (or throws the work away if a card failed).
+# network-boot driver (BootFlags) so Windows loads it when it boots from the network. Then it posts the result and
+# powers the VM off. Broom then saves the golden's next version (or throws the work away if a card failed).
 # Why: Windows booting from iSCSI only brings up a network card whose device it already knows - a driver alone is not
 # enough (tested in the lab: a never-seen card hung at the Windows spinner with its driver installed and flagged).
 # Creating the device the way Plug and Play would, inside the golden, is what makes the card bootable. Commercial
 # diskless systems offer a similar "add new hardware" step; this is Broom's own implementation of the idea.
 # ASCII only.
 $ErrorActionPreference = 'Continue'
-$dir = "$env:SystemRoot\Setup\Scripts"
-$job = Join-Path $dir 'broom-onboard.json'
-$out = Join-Path $dir 'broom-onboard-result.json'
-$log = Join-Path $dir 'broom-onboard.log'
+$srv = '__SERVER__'
+$tok = '__TOKEN__'
+$work = Join-Path $env:SystemRoot 'Temp\broom-onboard'
+New-Item -ItemType Directory -Force -Path $work | Out-Null
+$log = Join-Path $work 'broom-onboard.log'
+$script:text = ''
 function step($m) {
   $l = '{0:yyyy-MM-dd HH:mm:ss} {1}' -f (Get-Date), $m
+  $script:text += $l + "`r`n"
   try { [IO.File]::AppendAllText($log, $l + "`r`n") } catch { }
 }
 function done($ok, $nics, $msg) {
-  $r = [ordered]@{ ok = $ok; msg = $msg; nics = @($nics); windows = [Environment]::OSVersion.VersionString }
-  [IO.File]::WriteAllText($out, ($r | ConvertTo-Json -Depth 5), [Text.Encoding]::ASCII)
-  step "result: ok=$ok $msg - powering off"
+  step "result: ok=$ok $msg - posting it and powering off"
+  $r = [ordered]@{ ok = $ok; msg = $msg; nics = @($nics); windows = [Environment]::OSVersion.VersionString; log = $script:text }
+  $body = [Text.Encoding]::UTF8.GetBytes(($r | ConvertTo-Json -Depth 6))
+  for ($i = 0; $i -lt 5; $i++) {
+    try { Invoke-RestMethod -UseBasicParsing -TimeoutSec 30 -Method Post -ContentType 'application/json' -Body $body "http://$srv/api/onboard/result?t=$tok" | Out-Null; break }
+    catch { Start-Sleep -Seconds 3 }
+  }
   Stop-Computer -Force
   exit
 }
 step 'onboarding VM: started'
-if (-not (Test-Path $job)) { done $false @() 'no job file' }
-try { $j = Get-Content -Raw $job | ConvertFrom-Json } catch { done $false @() "job file unreadable: $_" }
+$j = $null
+for ($i = 0; $i -lt 10 -and -not $j; $i++) {
+  try { $j = Invoke-RestMethod -UseBasicParsing -TimeoutSec 20 "http://$srv/api/onboard/job?t=$tok" } catch { step "job not fetched yet: $_"; Start-Sleep -Seconds 3 }
+}
+if (-not $j) { done $false @() 'the job could not be fetched from the server' }
 
-# Drivers from Broom's library for these cards (Drivers page; Broom put each package under broom-drv\<name>): into the
-# driver store first, so "the best driver from the driver store" below can be one of them. Broom removes the folder.
+# Drivers from Broom's library for these cards (Drivers page; one folder per package in a tar): into the driver store
+# first, so "the best driver from the driver store" below can be one of them.
+$dd = Join-Path $work 'drv'
+if (@($j.drivers).Count -gt 0) {
+  try {
+    $tar = Join-Path $work 'drivers.tar'
+    Invoke-WebRequest -UseBasicParsing -TimeoutSec 300 -OutFile $tar "http://$srv/api/onboard/drivers?t=$tok"
+    New-Item -ItemType Directory -Force -Path $dd | Out-Null
+    & tar.exe -xf $tar -C $dd 2>&1 | Out-Null
+    if ($LASTEXITCODE) { step "tar.exe exit $LASTEXITCODE" }
+  } catch { step "driver packages not fetched: $_" }
+}
 foreach ($d in @($j.drivers)) {
   if (-not $d) { continue }
-  $p = Join-Path $dir $d
+  $p = Join-Path $dd $d
   if (-not (Test-Path $p)) { step "driver package $d missing"; continue }
   $o = & pnputil.exe /add-driver (Join-Path $p '*.inf') /subdirs 2>&1 | Out-String
   step ("driver package {0}: pnputil exit {1}: {2}" -f $d, $LASTEXITCODE, (($o -split "`r?`n" | Where-Object { $_ -match 'Added|Published|Failed|already|Total' }) -join ' | '))

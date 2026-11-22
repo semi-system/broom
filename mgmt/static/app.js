@@ -774,7 +774,7 @@ async function loadDiskless(){
       <td class="mono">${x.status?x.status.machines.filter(m=>m.connected).length:''}</td>
       <td><select class="form-select form-select-sm d-inline-block w-auto" data-perm="maintain" data-change="setMaint" data-args="${esc(JSON.stringify([g.name]))}">${opts(g.maint)}</select>${s&&s.update_connected?' <span class="text-success">'+ic('dot','')+' writable</span>':''}</td>
       <td class="mono">${s&&s.update_bytes?gbs(s.update_bytes)+` <button class="btn btn-sm btn-outline-primary" data-perm="maintain" ${act('saveMaint',g.name)}>Save</button> <button class="btn btn-sm btn-outline-secondary" data-perm="maintain" ${act('discardMaint',g.name)}>Discard</button>`:'—'}</td>
-      <td class="text-nowrap"><button class="btn btn-sm btn-outline-secondary" data-owner ${act('editGolden',g.name)}>Edit</button>${g.os==='windows'?` <button class="btn btn-sm btn-outline-secondary" data-perm="maintain" title="Write Broom's current startup script (broom-diskless.ps1) into this golden as its next version, without booting it. Needed once for goldens set up before the script updated itself." ${act('refreshGolden',g.name)}>Update script</button>`:''} <button class="btn btn-sm btn-outline-danger" data-owner ${act('delGolden',g.name)}>Delete</button></td></tr>`+verRow('golden',g.name,10);}).join('')
+      <td class="text-nowrap"><button class="btn btn-sm btn-outline-secondary" data-owner ${act('editGolden',g.name)}>Edit</button> <button class="btn btn-sm btn-outline-danger" data-owner ${act('delGolden',g.name)}>Delete</button></td></tr>`+verRow('golden',g.name,10);}).join('')
     ||'<tr><td colspan="10" class="mono">no golden yet — create one below</td></tr>';
   const vp=document.getElementById('ver_pct');if(vp&&verData&&document.activeElement!==vp)vp.value=verData.min_free_pct;
   const rm=dlData&&dlData.room;
@@ -819,19 +819,17 @@ async function loadDiskless(){
   const m=document.getElementById('dl_msg');if(m)say(m,d.error?' ✗ not served: '+d.error:'');
   loadPackages().catch(()=>{});loadOnboard().catch(()=>{});loadVm().catch(()=>{});}
 // "Server packages" (pkgmgr.rs): what the VM features need from the operating system, and the owner's Install.
-let pkTimer=null,pkCmd={},pkWas=false;
+let pkTimer=null,pkCmd='',pkWas=false;
 async function loadPackages(){
   const r=await j('/api/packages').catch(()=>null);const st=document.getElementById('pk_state');if(!r||!st)return;
-  const run=!!r.job&&r.job.state==='running';
+  const run=!!r.job&&r.job.state==='running',miss=r.missing||[];
   document.getElementById('pk_os').textContent=(r.os?r.os+'. ':'')+'Package manager: '+(r.manager||r.other&&r.other+' (not driven by Broom)'||'none found')+'.';
-  // One block per feature: what it lacks, the command, and the owner's Install for it.
-  const row=(key,title,f)=>{const miss=f.missing||[];pkCmd[key]=f.command||'';
-    if(!miss.length)return `<div class="mb-2"><b>${esc(title)}:</b> <span class="text-success">✓ everything it needs is installed.</span></div>`;
-    return `<div class="mb-2"><b>${esc(title)}:</b> missing ${esc(miss.map(m=>m.what+(m.package?' ('+m.package+')':'')).join(', '))}`
-      +(r.supported?`<div class="mono mt-1">${esc(f.command)}</div><button class="btn btn-sm btn-primary mt-1" data-owner ${act('pkInstall',key)}${run?' disabled':''}>Install</button>`
-        :`<div class="text-danger mt-1">${esc(f.hint||'')}</div>`)+'</div>';};
-  let h=row('vm','Maintain in the browser',r.vm)+row('hardware','Add hardware',r.hardware);
-  if(!r.kvm)h+='<div class="text-danger">/dev/kvm is missing: a VM needs KVM (turn on virtualisation in the firmware, or nested virtualisation when this server is itself a VM).</div>';
+  pkCmd=r.command||'';
+  let h=miss.length?'Missing: '+esc(miss.map(m=>m.what+(m.package?' ('+m.package+')':'')).join(', '))
+    :'<span class="text-success">✓ QEMU and OVMF are installed.</span>';
+  if(miss.length&&r.supported)h+=`<div class="mono mt-1">${esc(pkCmd)}</div><button class="btn btn-sm btn-primary mt-1" data-owner ${act('pkInstall')}${run?' disabled':''}>Install</button>`;
+  if(miss.length&&!r.supported)h+='<div class="text-danger mt-1">'+esc(r.hint||'')+'</div>';
+  if(!r.kvm)h+='<div class="text-danger mt-1">/dev/kvm is missing: a VM needs KVM (turn on virtualisation in the firmware, or nested virtualisation when this server is itself a VM).</div>';
   st.innerHTML=h;
   const lg=document.getElementById('pk_log'),jb=r.job;
   lg.hidden=!jb;
@@ -842,9 +840,9 @@ async function loadPackages(){
   if(pkWas&&!run)loadVm().catch(()=>{});
   pkWas=run;
 }
-async function pkInstall(feature){
-  if(!await sure('Run on this server, as root:\n\n'+(pkCmd[feature]||'')+'\n\nIt can take several minutes.'))return;
-  try{await j('/api/packages/install',mk({feature}));}catch(e){toast(e.message,true);}
+async function pkInstall(){
+  if(!await sure('Run on this server, as root:\n\n'+pkCmd+'\n\nIt can take several minutes.'))return;
+  try{await j('/api/packages/install',mk({}));}catch(e){toast(e.message,true);}
   loadPackages().catch(()=>{});
 }
 // "Add hardware": a new PC's network card installed into a Windows golden (onboard.rs).
@@ -926,7 +924,6 @@ const saveGolden=()=>dlCall('/api/diskless/golden',{name:v('dl_name'),os:v('dl_o
 const setMaint=(name,el)=>dlCall('/api/diskless/maint',{name,id:el.value?+el.value:null});
 const saveMaint=name=>dlCall('/api/diskless/save',{name},'Save the maintenance work on '+name+' as its next version? Its maintenance machine must be shut down. Every machine gets it at its next boot (and sets itself up again).');
 const discardMaint=name=>dlCall('/api/diskless/discard',{name},'Throw the maintenance work on '+name+' away?');
-const refreshGolden=name=>dlCall('/api/diskless/refresh',{name},'Write Broom\'s current startup script into '+name+' and save it as its next version? Every machine sets itself up again at its next boot. Needs no maintenance machine and no unsaved work.');
 const delGolden=name=>dlCall('/api/diskless/golden/delete',{name},'Delete golden '+name+', all its versions and every machine\'s layers of it?');
 const isoOs=(name,el)=>dlCall('/api/diskless/iso/os',{name,os:el.value});
 const delIso=name=>dlCall('/api/diskless/iso/delete',{name},'Delete '+name+' from the ISO library?');
@@ -1529,7 +1526,7 @@ const ACTIONS={
   loadImages,addImage,setDefault,toggleCache,toggleSsd,togglePreload,editImgGroups,republish,showVersions,exportImage,editBoot,delImage,
   snapshotImage,dedupImage,rollbackImage,versionToImage,deleteVersion,
   loadGames,saveGames,setGamesUpdate,toggleGamesRam,saveGamesUpdate,discardGamesUpdate,editGames,delGames,
-  loadDiskless,dlOsChanged,mPower,mSelOne,mSelAll,hwToggle,hwDisplay,mDisplay,startOnboard,cancelOnboard,retryOnboard,verToggle,verPin,verDrop,verKeepFree,setRoom,noticeDismiss,vmSize,dlRebuild,roleSave,roleAdd,roleDel,vmStart,vmStop,vmGamesSave,vmGamesDiscard,saveGolden,setMaint,saveMaint,discardMaint,refreshGolden,delGolden,editGolden,isoOs,delIso,setPlace,uploadIso,
+  loadDiskless,dlOsChanged,mPower,mSelOne,mSelAll,hwToggle,hwDisplay,mDisplay,startOnboard,cancelOnboard,retryOnboard,verToggle,verPin,verDrop,verKeepFree,setRoom,noticeDismiss,vmSize,dlRebuild,roleSave,roleAdd,roleDel,vmStart,vmStop,vmGamesSave,vmGamesDiscard,saveGolden,setMaint,saveMaint,discardMaint,delGolden,editGolden,isoOs,delIso,setPlace,uploadIso,
   loadDrivers,uploadDriver,saveDrvTargets,delDriver,
   loadGroups,editGroup,closeGroup,saveGroup,createGroup,renameGroup,deleteGroup,saveNewMachines,
   loadServer,loadBench,loadBenchHist,logsReload,logsFollow,logsSearch,benchServer,benchRequest:()=>benchAsk(false),benchCancel:()=>benchAsk(true),bSelAll,

@@ -1132,16 +1132,21 @@ pub(crate) fn script_text(st: &SharedState) -> String {
     crate::assets::text("scripts/broom-diskless.ps1").replace("__SERVER__", &srv)
 }
 
-/// GET /broom-diskless.ps1 — the script installed on a golden (irm … | iex), with this server's address.
+/// GET /broom-diskless.ps1 — the script installed on a golden (irm … | iex), with this server's address. To the VM of
+/// a running Add hardware job (onboard.rs) it is the job's script: the golden's startup task fetches this at every
+/// start and runs it instead of its own copy.
 async fn script(
     State(st): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> ([(axum::http::HeaderName, &'static str); 1], String) {
+    let text = crate::onboard::vm_script(&st, peer.ip().to_canonical())
+        .unwrap_or_else(|| script_text(&st));
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; charset=utf-8",
         )],
-        script_text(&st),
+        text,
     )
 }
 
@@ -1269,6 +1274,10 @@ async fn client(
 ) -> Result<Response, ApiError> {
     // The maintenance VM on this server (vmmaint.rs): reaches us through QEMU's NAT, from our own address.
     if let Some(v) = crate::vmmaint::client_answer(&st, peer.ip().to_canonical()) {
+        return Ok(Json(v).into_response());
+    }
+    // The VM of an Add hardware job (onboard.rs): the same way in, with the maintenance role.
+    if let Some(v) = crate::onboard::client_answer(&st, peer.ip().to_canonical()) {
         return Ok(Json(v).into_response());
     }
     let peer = peer.ip().to_canonical().to_string();

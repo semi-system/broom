@@ -230,8 +230,9 @@ PC down.
 - **Windows goldens:** run `irm http://<server>/broom-diskless.ps1 | iex` on the golden (as Administrator) before
   the first Save: each machine then takes its own name (Devices page) on its first boot, kept as its base. At every
   start the golden's copy runs the server's current version of the script, so a newer Broom reaches every machine
-  without a new golden version. A golden set up before that: **Update script** (Diskless page) writes the current
-  script into it as its next version, without booting it.
+  without a new golden version. A golden set up before that (its copy is the whole script, not the one that fetches
+  the server's) or after Broom moved to another address (the copy holds the server's address): run the command again
+  on it, in its maintenance machine or in **Maintain in the browser**, and Save.
 - **Windows on a disk that starts fresh at every boot:** that script also sets Windows for it. Always: no automatic
   BitLocker device encryption (Windows 11 turns it on by itself on a PC with a TPM), no hibernation, System Restore,
   scheduled defrag, search index, SysMain or crash dump, no "last access" time written for every file read, and ping
@@ -279,13 +280,15 @@ PC down.
   golden has never seen (a new board, or a card in another slot), pick the golden and that PC under *Add hardware*
   and press Start. Its next network boot starts Windows PE (wimboot + the Windows PE of the golden's installer ISO;
   Microsoft-signed, so it also works with *Secure Boot clients*), which reports its cards to Broom (the report
-  counts only with the job's token and from that PC's network card). Broom attaches the golden's newest version to
-  itself (iSCSI over 127.0.0.1, with that job's own write key), boots it in a small VM (QEMU/KVM, no network,
-  confined as the maintenance VM) where
-  `broom-onboard.ps1`, run by the golden's own startup task, creates each card's device with that instance ID and lets
-  Windows install the best driver from its driver store, marked as a network-boot driver; then Broom saves the golden's
-  next version and the PC restarts into it. Identical PCs need it once; a PC whose cards are all known finishes at
-  once. Needs on the server: `qemu-system-x86_64` (or `qemu-kvm`), OVMF, `iscsiadm` (open-iscsi), `ntfs-3g` and `/dev/kvm` (the Diskless page lists what is missing, with an **Install** button for owners): a
+  counts only with the job's token and from that PC's network card). Broom boots the golden's newest version in a
+  small VM (QEMU/KVM, confined as the maintenance VM; its disk is an NBD export of Broom's own daemon, written with
+  that job's own key, and it reaches the server through QEMU's NAT). The golden's own startup task asks the server for
+  its script, and to this VM the server answers with `broom-onboard.ps1`, which gets the job and the library's drivers
+  over HTTP, creates each card's device with that instance ID and lets Windows install the best driver from its
+  driver store, marked as a network-boot driver; then Broom saves the golden's next version and the PC restarts into
+  it. Nothing is written into the golden's disk by Broom itself. Identical PCs need it once; a PC whose cards are all
+  known finishes at once. Needs on the server: `qemu-system-x86_64` (or `qemu-kvm`), OVMF and `/dev/kvm` (the
+  Diskless page lists what is missing, with an **Install** button for owners): a
   physical server with virtualization (Intel VT-x / AMD-V) turned on in its BIOS, or — when Broom itself runs in a
   VM — a host with nested virtualization on and CPU type *host* for that VM. The card needs a driver in Windows PE (to report) and in the
   golden (to install). **Network-card drivers from the library** (Drivers page; packages whose .inf is Class=Net are
@@ -326,8 +329,8 @@ PC down.
   is booted with into a route to its disk *through* that gateway, even on the same subnet, so every disk read would
   go through the router (and a router that tracks connections drops Windows' new connections to Broom). When Broom is
   on the PC's subnet, the Windows boot leaves the gateway out and the startup script adds the router as the default
-  route once the disk is up. After moving Broom to another address, **Update script** (Diskless page) writes the new
-  address into the golden.
+  route once the disk is up. After moving Broom to another address, run the command of the Windows goldens again on
+  each golden (its copy of the script holds the server's address) and Save.
 
 **Tested so far**, on virtual-machine clients: Windows 11 24H2 and Ubuntu 26.04 goldens end to end — installed from the
 library (the golden attached, the installer from the server), maintained, saved, then booted diskless: each machine's
@@ -457,12 +460,9 @@ sends it over plain HTTP. What the network must do:
   filesystems on loop devices (`xfsprogs`, `e2fsprogs`).
 - **iPXE** is fetched at `mgmt/ipxe/IPXE_COMMIT`, patched with `mgmt/ipxe/patches/` and embedded; rebuilt only when
   those change (`--ipxe` forces it).
-- **Add hardware, Update script and Maintain in the browser** attach the golden to the server itself over iSCSI
-  (open-iscsi, loopback). A server running the multipath service (`multipathd`, on by default on Ubuntu Server)
-  takes a disk it has seen twice at the same time — two logins of one golden by hand, for instance — at every later
-  login; Broom then refuses the job and says so. Keep multipath off Broom's own disks:
-  `/etc/multipath/conf.d/broom.conf` with `blacklist { device { vendor "BROOM" product ".*" } }`, then
-  `multipath -w <ID>` for an ID already in `/etc/multipath/wwids` and `multipathd reconfigure`.
+- **Add hardware and Maintain in the browser** give the golden to QEMU over NBD, from Broom's own iSCSI daemon on a
+  root-only Unix socket: the server attaches no disk to itself (no iSCSI initiator, no multipath to keep away, no
+  mount).
 - **Add hardware** runs `broom-report.exe` in Windows PE. A release gets it from CI (built from
   `mgmt/winpe/broom-report.c`; no binary of it is in the repository). A local build: install `gcc-mingw-w64-x86-64`,
   `./build.sh` then also makes `mgmt/dist/broom-report.exe` — copy it to `<Broom's folder>/winpe/` on the server.

@@ -30,30 +30,15 @@ fn os_release_name() {
     assert_eq!(os_name(""), "");
 }
 
-/// What is missing follows what was found, in the order the page lists it. The VM needs QEMU and OVMF only (its disks
-/// come over NBD from the daemon); Add hardware also writes into the golden's disk.
+/// What is missing follows what was found, in the order the page lists it. The VM of both features needs QEMU and OVMF
+/// only: its disk comes over NBD from the daemon, and Add hardware's job over HTTP.
 #[test]
 fn missing_follows_what_is_found() {
     let found = |list: &'static [Pkg]| move |p: Pkg| list.contains(&p);
-    let all = &[Pkg::Qemu, Pkg::Ovmf, Pkg::Iscsi, Pkg::Ntfs3g];
-    assert!(missing_with(Feature::Hardware, found(all)).is_empty());
-    assert_eq!(
-        missing_with(Feature::Hardware, found(&[Pkg::Ovmf, Pkg::Ntfs3g])),
-        vec![Pkg::Qemu, Pkg::Iscsi]
-    );
-    assert_eq!(
-        missing_with(Feature::Hardware, found(&[])),
-        vec![Pkg::Qemu, Pkg::Ovmf, Pkg::Iscsi, Pkg::Ntfs3g]
-    );
-    // The VM without open-iscsi and ntfs-3g is complete.
-    assert!(missing_with(Feature::Vm, found(&[Pkg::Qemu, Pkg::Ovmf])).is_empty());
-    assert_eq!(
-        missing_with(Feature::Vm, found(&[Pkg::Iscsi, Pkg::Ntfs3g])),
-        vec![Pkg::Qemu, Pkg::Ovmf]
-    );
-    assert_eq!(Feature::parse("vm"), Some(Feature::Vm));
-    assert_eq!(Feature::parse("hardware"), Some(Feature::Hardware));
-    assert_eq!(Feature::parse("x"), None);
+    assert!(missing_with(found(&[Pkg::Qemu, Pkg::Ovmf])).is_empty());
+    assert_eq!(missing_with(found(&[Pkg::Ovmf])), vec![Pkg::Qemu]);
+    assert_eq!(missing_with(found(&[Pkg::Qemu])), vec![Pkg::Ovmf]);
+    assert_eq!(missing_with(found(&[])), vec![Pkg::Qemu, Pkg::Ovmf]);
 }
 
 /// Debian-family names; RHEL-family names (qemu-kvm, edk2-ovmf, iscsi-initiator-utils) for dnf and yum alike.
@@ -61,34 +46,31 @@ fn missing_follows_what_is_found() {
 fn package_names() {
     assert_eq!(package(Mgr::Apt, Pkg::Qemu), "qemu-system-x86");
     assert_eq!(package(Mgr::Apt, Pkg::Ovmf), "ovmf");
-    assert_eq!(package(Mgr::Apt, Pkg::Iscsi), "open-iscsi");
     for m in [Mgr::Dnf, Mgr::Yum] {
         assert_eq!(package(m, Pkg::Qemu), "qemu-kvm");
         assert_eq!(package(m, Pkg::Ovmf), "edk2-ovmf");
-        assert_eq!(package(m, Pkg::Iscsi), "iscsi-initiator-utils");
     }
-    assert_eq!(package(Mgr::Dnf, Pkg::Ntfs3g), "ntfs-3g");
 }
 
 /// apt refreshes its lists first; dnf / yum install at once; always non-interactive (-y); nothing missing, nothing to
 /// run; and only the missing packages are named.
 #[test]
 fn install_commands() {
-    let all = [Pkg::Qemu, Pkg::Ovmf, Pkg::Iscsi, Pkg::Ntfs3g];
+    let all = [Pkg::Qemu, Pkg::Ovmf];
     let apt = steps(Mgr::Apt, &all);
     assert_eq!(apt.len(), 2);
     assert_eq!(apt[0], ["apt-get", "update"]);
     assert_eq!(
         command_line(&apt),
-        "apt-get update && apt-get install -y qemu-system-x86 ovmf open-iscsi ntfs-3g"
+        "apt-get update && apt-get install -y qemu-system-x86 ovmf"
     );
     assert_eq!(
         command_line(&steps(Mgr::Dnf, &[Pkg::Qemu, Pkg::Ovmf])),
         "dnf install -y qemu-kvm edk2-ovmf"
     );
     assert_eq!(
-        command_line(&steps(Mgr::Yum, &[Pkg::Ntfs3g])),
-        "yum install -y ntfs-3g"
+        command_line(&steps(Mgr::Yum, &[Pkg::Ovmf])),
+        "yum install -y edk2-ovmf"
     );
     assert!(steps(Mgr::Apt, &[]).is_empty());
     assert_eq!(command_line(&[]), "");

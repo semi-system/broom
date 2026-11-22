@@ -19,16 +19,18 @@
 //     so this works under Secure Boot too) plus broom-report.exe (winpe/broom-report.c), which sends Broom what Windows
 //     sees (pnputil: instance IDs, hardware IDs, compatible IDs of every network card; wmic: their MACs) and shows the
 //     progress.
-//  3. Broom attaches the golden's newest version writable to itself (iSCSI over 127.0.0.1: the golden's "update
-//     machine" is the loopback address while the job runs — the network cannot send from it), puts broom-onboard.ps1
-//     in place of the golden's broom-diskless.ps1 (its startup task runs it as SYSTEM) with the job next to it, and boots
-//     the golden in a small VM on this server (QEMU/KVM, AHCI disk, no network). The script creates each card's device
-//     with that exact instance ID, lets Windows install the best driver from the driver store, marks the driver as a
-//     network-boot driver, writes its result and powers off.
-//  4. Broom puts the original script back and saves the work as the golden's next version (Discard on any failure —
-//     the golden stays as it was), records the hardware, and the PC restarts into the golden.
-// Needs on the server: qemu-system-x86_64 + OVMF, open-iscsi (iscsiadm), ntfs-3g, /dev/kvm (nested KVM when Broom
-// itself runs in a VM). The golden needs broom-diskless.ps1 installed (its startup task).
+//  3. Broom boots the golden's newest version in a small VM on this server (QEMU/KVM, AHCI disk): the disk is an NBD
+//     export of Broom's own iSCSI daemon with the job's write key, so everything the guest writes is the golden's
+//     "update session" (the loopback address alone does not get to write it), and QEMU's NAT gives the guest the server.
+//     The golden's own startup task asks the server who it is and fetches the server's current script; to this VM
+//     the server answers with broom-onboard.ps1 and the job's token (see "the VM's side of the job" below). The script
+//     gets the job and the library's drivers over HTTP, creates each card's device with that exact instance ID, lets
+//     Windows install the best driver from the driver store, marks the driver as a network-boot driver, posts its
+//     result and powers off. Nothing is written into the golden by the server: no mount, no ntfs-3g, no iscsiadm.
+//  4. Broom saves the guest's work as the golden's next version (Discard on any failure — the golden stays as it
+//     was), records the hardware, and the PC restarts into the golden.
+// Needs on the server: qemu-system-x86_64 + OVMF and /dev/kvm (nested KVM when Broom itself runs in a VM). The golden
+// needs broom-diskless.ps1 installed (its startup task), of a Broom that fetches the server's version of it.
 use axum::{
     Json, Router,
     body::Body,
@@ -135,6 +137,12 @@ pub struct Job {
     /// Unix time the PC fetched Windows PE (0 = not yet): a report long after that = no network in Windows PE.
     #[serde(default)]
     pub winpe_at: u64,
+    /// The library's driver packages the VM installs from (folders of the tar the VM downloads).
+    #[serde(default)]
+    pub drivers: Vec<String>,
+    /// What the VM's script posted when it finished: {ok, msg, nics, windows}.
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
 }
 
 /// iPXE's `${net0/busid}` → `PCI\VEN_xxxx&DEV_yyyy`. iPXE prints it as hex bytes, colon-separated or not: bus type
@@ -195,8 +203,11 @@ pub fn routes() -> Router<SharedState> {
         .route("/api/onboard/start", post(start))
         .route("/api/onboard/cancel", post(cancel))
         .route("/api/onboard/retry", post(retry))
-        .route("/api/diskless/refresh", post(refresh))
-        // Public: the PC itself (Windows PE, by the job's token; iPXE, by its IP + MAC).
+        // Public: the PC itself (Windows PE, by the job's token; iPXE, by its IP + MAC), and the job's VM (this server
+        // itself, by the token).
+        .route("/api/onboard/job", get(vm_job_json))
+        .route("/api/onboard/drivers", get(vm_drivers))
+        .route("/api/onboard/result", post(vm_result))
         .route("/api/onboard/report", post(report))
         .route("/api/onboard/state", get(state_q))
         .route("/boot/onboard", get(boot))
@@ -659,20 +670,11 @@ pub(crate) fn reporter_missing() -> Option<String> {
 
 // ---------- the VM side ----------
 
-/// What Add hardware needs on this server (the VM, and open-iscsi + ntfs-3g to write into the golden); Err lists what
-/// is missing.
+/// What the VM of either feature (Add hardware, Maintain in the browser) needs on this server: QEMU, OVMF and KVM. Its
+/// disk comes over NBD from Broom's own daemon and Add hardware's job over HTTP: no open-iscsi, no ntfs-3g. Err lists
+/// what is missing.
 pub(crate) fn preflight() -> Result<(), String> {
-    check(crate::pkgmgr::Feature::Hardware)
-}
-
-/// What the maintenance VM needs (Maintain in the browser): QEMU, OVMF and KVM — its disks come over NBD, from the
-/// daemon, so no open-iscsi.
-pub(crate) fn preflight_vm() -> Result<(), String> {
-    check(crate::pkgmgr::Feature::Vm)
-}
-
-fn check(feature: crate::pkgmgr::Feature) -> Result<(), String> {
-    let pkgs = crate::pkgmgr::missing(feature);
+    let pkgs = crate::pkgmgr::missing();
     let mut miss: Vec<String> = pkgs.iter().map(|p| p.what().to_string()).collect();
     if !FsPath::new("/dev/kvm").exists() {
         miss.push("/dev/kvm (KVM; a VM needs nested virtualisation and CPU type host)".into());
@@ -790,8 +792,10 @@ pub(crate) fn ovmf() -> Option<(PathBuf, PathBuf)> {
     .find(|(c, v)| c.is_file() && v.is_file())
 }
 
-/// QEMU's arguments: the golden as an AHCI disk (Windows has storahci at boot), no network, no screen (QMP socket for
-/// a screenshot when debugging), off = exit.
+/// QEMU's arguments: the golden as an AHCI disk (Windows has storahci at boot) — the daemon's NBD export `disk` on its
+/// root-only socket, like the maintenance VM's (vmmaint.rs) — QEMU's own NAT with an e1000e (Windows has its driver):
+/// the golden's startup script fetches Broom's script for this job from the server through it, and nothing else is
+/// given (no screen: a QMP socket for a screenshot when debugging), off = exit.
 pub(crate) fn qemu_args(disk: &str, code: &str, vars: &str, qmp: &str) -> Vec<String> {
     [
         "-name",
@@ -808,17 +812,16 @@ pub(crate) fn qemu_args(disk: &str, code: &str, vars: &str, qmp: &str) -> Vec<St
         &format!("if=pflash,format=raw,readonly=on,file={}", qpath(code)),
         "-drive",
         &format!("if=pflash,format=raw,file={}", qpath(vars)),
-        "-drive",
-        &format!(
-            "file={},format=raw,if=none,id=d0,cache=none,aio=threads",
-            qpath(disk)
-        ),
+        "-blockdev",
+        &crate::vmmaint::nbd_blockdev("d0", disk),
         "-device",
         "ahci,id=sata",
         "-device",
         "ide-hd,drive=d0,bus=sata.0,bootindex=1",
-        "-nic",
-        "none",
+        "-netdev",
+        "user,id=n0",
+        "-device",
+        "e1000e,netdev=n0",
         "-display",
         "none",
         "-vga",
@@ -832,287 +835,6 @@ pub(crate) fn qemu_args(disk: &str, code: &str, vars: &str, qmp: &str) -> Vec<St
     .collect()
 }
 
-/// Run a command to its end (at most `t`); stdout+stderr on success.
-pub(crate) fn sh(cmd: &str, args: &[&str], t: Duration) -> Result<String, String> {
-    let mut c = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{cmd}: {e}"))?;
-    let t0 = Instant::now();
-    loop {
-        match c.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if t0.elapsed() > t => {
-                let _ = c.kill();
-                let _ = c.wait();
-                return Err(format!("{cmd} {}: timed out", args.join(" ")));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(format!("{cmd}: {e}")),
-        }
-    }
-    let o = c.wait_with_output().map_err(|e| e.to_string())?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    );
-    if o.status.success() {
-        Ok(text)
-    } else {
-        Err(format!(
-            "{cmd} {}: {}",
-            args.join(" "),
-            text.trim().lines().last().unwrap_or("failed")
-        ))
-    }
-}
-
-const PORTAL: &str = "127.0.0.1:3260";
-
-/// The golden's writable target attached to this server: its block device.
-pub(crate) fn login(target: &str) -> Result<PathBuf, String> {
-    login_as_named(target).map_err(|e| hide_key(&e, target))
-}
-
-/// `text` without the write key of `target` ("<iqn>.g<k>.u<key>", local_target): what a failed login says ends up in
-/// the job's messages and the log, which every account reads.
-pub(crate) fn hide_key(text: &str, target: &str) -> String {
-    match crate::iscsid::games::split_key(target).1 {
-        Some(key) => text.replace(key, "(key)"),
-        None => text.to_string(),
-    }
-}
-
-fn login_as_named(target: &str) -> Result<PathBuf, String> {
-    let t = Duration::from_secs(30);
-    let _ = sh(
-        "iscsiadm",
-        &["-m", "node", "-o", "new", "-T", target, "-p", PORTAL],
-        t,
-    );
-    sh(
-        "iscsiadm",
-        &["-m", "node", "-T", target, "-p", PORTAL, "--login"],
-        t,
-    )?;
-    let dev = PathBuf::from(format!(
-        "/dev/disk/by-path/ip-{PORTAL}-iscsi-{target}-lun-0"
-    ));
-    for _ in 0..100 {
-        if dev.exists() {
-            let _ = sh("udevadm", &["settle", "-t", "10"], Duration::from_secs(15));
-            if let Some(why) = taken(FsPath::new("/sys/class/block"), &dev) {
-                logout(target);
-                return Err(format!("{target}: {why}"));
-            }
-            return Ok(dev);
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    Err(format!("{target}: no disk appeared after the iSCSI login"))
-}
-
-/// Why the freshly attached disk `dev` cannot be used as it is: another layer of this server sits on it. That is
-/// the multipath service, once it has seen the disk twice at the same time (two logins of one golden) and noted its
-/// ID: from then on it takes the disk at every login, its partitions appear on the multipath device only, and what
-/// is written past it is not safe. `sys` = /sys/class/block.
-pub(crate) fn taken(sys: &FsPath, dev: &FsPath) -> Option<String> {
-    let real = std::fs::canonicalize(dev).ok()?;
-    let name = real.file_name()?.to_str()?;
-    let holders: Vec<String> = std::fs::read_dir(sys.join(name).join("holders"))
-        .ok()?
-        .flatten()
-        .filter_map(|e| e.file_name().to_str().map(String::from))
-        .collect();
-    (!holders.is_empty()).then(|| {
-        format!(
-            "this server's multipath service has taken the disk ({name} is under {}): Broom needs it as a plain \
-             disk. Keep multipath off Broom's own disks — /etc/multipath/conf.d/broom.conf with \
-             `blacklist {{ device {{ vendor \"BROOM\" product \".*\" }} }}`, then `multipath -w <its ID>` for an ID \
-             already in /etc/multipath/wwids and `multipathd reconfigure` — and try again",
-            holders.join(", ")
-        )
-    })
-}
-
-pub(crate) fn logout(target: &str) {
-    let t = Duration::from_secs(30);
-    let _ = sh(
-        "iscsiadm",
-        &["-m", "node", "-T", target, "-p", PORTAL, "--logout"],
-        t,
-    );
-    let _ = sh(
-        "iscsiadm",
-        &["-m", "node", "-o", "delete", "-T", target, "-p", PORTAL],
-        t,
-    );
-}
-
-// ---------- files inside a mounted golden ----------
-// A golden is written by whatever ran in it (its maintenance session, with internet), and an NTFS volume can hold
-// symbolic links to anywhere — ntfs-3g shows them as Linux links, and "../../.." climbs out of the mount. This server
-// reads, writes and deletes there as root, so nothing inside a mounted golden is ever reached through a link: every
-// part of a path is checked (`ci_path`), and files are opened with O_NOFOLLOW (`g_read`, `g_write`). The volume is
-// mounted by this server alone while it works on it, so what was checked cannot change underneath.
-
-/// `rel` under `root` (a mounted golden), its parts matched without regard to case (NTFS names) — None when a part
-/// is missing or is a symbolic link (logged: a golden has no business holding one on these paths).
-pub(crate) fn ci_path(root: &FsPath, rel: &str) -> Option<PathBuf> {
-    let mut cur = root.to_path_buf();
-    for part in rel.split('/').filter(|p| !p.is_empty()) {
-        let exact = cur.join(part);
-        let next = if std::fs::symlink_metadata(&exact).is_ok() {
-            exact
-        } else {
-            std::fs::read_dir(&cur)
-                .ok()?
-                .flatten()
-                .find(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(part))
-                })?
-                .path()
-        };
-        if is_link(&next) {
-            tracing::warn!(
-                "golden: {} is a symbolic link - not followed",
-                next.strip_prefix(root).unwrap_or(&next).display()
-            );
-            return None;
-        }
-        cur = next;
-    }
-    Some(cur)
-}
-
-/// `p` itself is a symbolic link (not what it points to).
-fn is_link(p: &FsPath) -> bool {
-    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
-}
-
-/// `name` in folder `dir` of a mounted golden (`dir` from `ci_path`), for a file or folder this server makes there:
-/// refused when something of that name is there as a symbolic link.
-pub(crate) fn g_child(dir: &FsPath, name: &str) -> Result<PathBuf, String> {
-    let p = dir.join(name);
-    if is_link(&p) {
-        return Err(format!(
-            "{name} in the golden is a symbolic link - not touched"
-        ));
-    }
-    Ok(p)
-}
-
-/// The largest file of a golden read into memory (scripts, driver .inf / .cat files: kilobytes to a few megabytes).
-const G_READ_MAX: u64 = 64 << 20;
-
-/// A file of a mounted golden, read without following a link at its name: what is inside a golden is whatever its
-/// Windows wrote there.
-pub(crate) fn g_read(p: &FsPath) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut v = Vec::new();
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(p)
-        .and_then(|f| f.take(G_READ_MAX + 1).read_to_end(&mut v))
-        .map_err(|e| format!("{}: {e}", p.display()))?;
-    if v.len() as u64 > G_READ_MAX {
-        return Err(format!(
-            "{}: larger than {} MB — not a file this server reads whole",
-            p.display(),
-            G_READ_MAX >> 20
-        ));
-    }
-    Ok(v)
-}
-
-/// A file of a mounted golden written (made or replaced) without following a link at its name.
-pub(crate) fn g_write(p: &FsPath, data: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(p)
-        .and_then(|mut f| f.write_all(data))
-        .map_err(|e| format!("{}: {e}", p.display()))
-}
-
-struct Mount {
-    dir: PathBuf,
-}
-
-impl Mount {
-    fn new(part: &FsPath, dir: &FsPath, rw: bool) -> Result<Mount, String> {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let p = part.to_string_lossy();
-        let d = dir.to_string_lossy();
-        // Nothing in a golden is run, trusted as a device or as a set-uid program on this server.
-        let opts = if rw {
-            "nosuid,nodev,noexec"
-        } else {
-            "ro,nosuid,nodev,noexec"
-        };
-        sh(
-            "ntfs-3g",
-            &["-o", opts, p.as_ref(), d.as_ref()],
-            Duration::from_secs(60),
-        )?;
-        Ok(Mount {
-            dir: dir.to_path_buf(),
-        })
-    }
-}
-
-impl Drop for Mount {
-    fn drop(&mut self) {
-        let d = self.dir.to_string_lossy().to_string();
-        for _ in 0..10 {
-            if sh("umount", &[&d], Duration::from_secs(60)).is_ok() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        tracing::error!("add hardware: could not unmount {d}");
-    }
-}
-
-/// The Windows partition of `dev`: the NTFS one with Windows\System32\config\SYSTEM.
-fn windows_part(dev: &FsPath, mnt: &FsPath) -> Result<PathBuf, String> {
-    let real = std::fs::canonicalize(dev).map_err(|e| e.to_string())?;
-    let base = real
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string();
-    let mut parts: Vec<PathBuf> = std::fs::read_dir("/sys/class/block")
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .filter_map(|e| e.file_name().to_str().map(String::from))
-        .filter(|n| n.starts_with(&base) && n.len() > base.len())
-        .map(|n| PathBuf::from("/dev").join(n))
-        .collect();
-    parts.sort();
-    for p in parts {
-        let Ok(m) = Mount::new(&p, mnt, false) else {
-            continue;
-        };
-        if ci_path(&m.dir, "Windows/System32/config/SYSTEM").is_some_and(|f| f.is_file()) {
-            return Ok(p);
-        }
-    }
-    Err("no Windows partition on the golden".into())
-}
-
 /// The VM's work folder: <writeback place>/.onboard
 fn work_dir(st: &SharedState) -> Result<PathBuf, String> {
     let d = diskless::dir_of(st, "writeback")?.join(".onboard");
@@ -1121,7 +843,7 @@ fn work_dir(st: &SharedState) -> Result<PathBuf, String> {
 }
 
 /// Boot the golden in the VM once; Ok(()) when QEMU ended by itself (the guest powered off or restarted).
-fn run_vm(st: &SharedState, token: &str, disk: &FsPath, work: &FsPath) -> Result<(), String> {
+fn run_vm(st: &SharedState, token: &str, export: &str, work: &FsPath) -> Result<(), String> {
     crate::sysmon::room_for_vm(VM_MB, crate::sysmon::meminfo("MemAvailable:"))?;
     let (code, vars_t) = ovmf().ok_or("no OVMF")?;
     let vars = work.join("vars.fd");
@@ -1129,7 +851,7 @@ fn run_vm(st: &SharedState, token: &str, disk: &FsPath, work: &FsPath) -> Result
     let qmp = work.join("qmp.sock");
     let _ = std::fs::remove_file(&qmp);
     let mut args = qemu_args(
-        &disk.to_string_lossy(),
+        export,
         &code.to_string_lossy(),
         &vars.to_string_lossy(),
         &qmp.to_string_lossy(),
@@ -1177,6 +899,122 @@ fn run_vm(st: &SharedState, token: &str, disk: &FsPath, work: &FsPath) -> Result
     r
 }
 
+// ---------- the VM's side of the job ----------
+// The golden's startup task (broom-diskless.ps1) asks the server what the machine is (/api/diskless/client) and then
+// runs the server's current version of the script (it fetches it at every start). For the one VM of a running job
+// both answers are the job's: role "maintenance", and Broom's onboarding script (scripts/broom-onboard.ps1) with the
+// job's token in it. That script gets the job and the library's drivers over HTTP, installs the cards and posts its
+// result. So nothing is written into the golden's disk by the server — no mount, no ntfs-3g, no iscsiadm: the disk
+// reaches QEMU over NBD (vmmaint::nbd_blockdev) and the guest's own writes are the update session Save keeps.
+// Who may ask: the connection comes from this server itself (the VM reaches it through QEMU's NAT, like the
+// maintenance VM) and carries the job's token; the token is only ever in the script served to that connection.
+
+/// The running job, when `peer` is this server (the job's VM: nothing else on this server runs a job's script).
+pub(crate) fn vm_job(st: &SharedState, peer: std::net::IpAddr) -> Option<Job> {
+    job(st).filter(|j| {
+        j.state == "installing" && crate::vmmaint::is_own(peer, &crate::tls::local_ipv4s())
+    })
+}
+
+/// What /api/diskless/client answers the job's VM (the maintenance role: no machine base, no agent).
+pub(crate) fn client_answer(st: &SharedState, peer: std::net::IpAddr) -> Option<serde_json::Value> {
+    let j = vm_job(st, peer)?;
+    Some(serde_json::json!({
+        "role": "maintenance",
+        "vm": true,
+        "golden": j.golden,
+        "host": "",
+        "games": "",
+    }))
+}
+
+/// What /broom-diskless.ps1 answers the job's VM: the onboarding script, with this server's address and the job's token.
+pub(crate) fn vm_script(st: &SharedState, peer: std::net::IpAddr) -> Option<String> {
+    let j = vm_job(st, peer)?;
+    let srv = st.db.get_config("dhcp_server_ip", "");
+    Some(
+        crate::assets::text("scripts/broom-onboard.ps1")
+            .replace("__SERVER__", &srv)
+            .replace("__TOKEN__", &j.token),
+    )
+}
+
+/// The job a request of the VM is for: from this server, with the job's token.
+fn vm_asking(
+    st: &SharedState,
+    q: &HashMap<String, String>,
+    peer: std::net::IpAddr,
+) -> Result<Job, ApiError> {
+    let j = vm_job(st, peer.to_canonical()).ok_or((
+        StatusCode::FORBIDDEN,
+        "no job is running a VM here".to_string(),
+    ))?;
+    if !q.get("t").is_some_and(|t| token_matches(&j.token, t)) {
+        return Err((StatusCode::FORBIDDEN, "wrong job".into()));
+    }
+    Ok(j)
+}
+
+/// GET /api/onboard/job?t= (public: the job's VM) — what the script installs: the cards and the driver packages.
+async fn vm_job_json(
+    State(st): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let j = vm_asking(&st, &q, peer.ip())?;
+    Ok(Json(
+        serde_json::json!({"golden": j.golden, "nics": j.nics, "drivers": j.drivers}),
+    ))
+}
+
+/// GET /api/onboard/drivers?t= (public: the job's VM) — the library's driver packages of this job, one folder each, in a
+/// tar (Windows' tar.exe unpacks it).
+async fn vm_drivers(
+    State(st): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let j = vm_asking(&st, &q, peer.ip())?;
+    let tar = tokio::task::spawn_blocking(move || crate::drivers::bundle_of(&j.drivers))
+        .await
+        .map_err(ise)?
+        .map_err(ise)?;
+    Ok(([(header::CONTENT_TYPE, "application/x-tar")], tar).into_response())
+}
+
+/// The longest log the VM's script may leave with the job (it is kept in the work folder).
+const VM_LOG_MAX: usize = 100_000;
+
+/// POST /api/onboard/result?t= (public: the job's VM) — {ok, msg, nics, windows, log}: what the script did per card.
+async fn vm_result(
+    State(st): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Query(q): Query<HashMap<String, String>>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let j = vm_asking(&st, &q, peer.ip())?;
+    let mut v: serde_json::Value = serde_json::from_str(body.trim_start_matches('\u{feff}'))
+        .map_err(|e| bad(format!("result unreadable: {e}")))?;
+    let log: String = v["log"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .take(VM_LOG_MAX)
+        .collect();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("log");
+    }
+    tokio::task::spawn_blocking(move || {
+        if let Ok(w) = work_dir(&st) {
+            let _ = std::fs::write(w.join("broom-onboard.log"), &log);
+        }
+        update(&st, &j.token, |j| j.result = Some(v));
+    })
+    .await
+    .map_err(ise)?;
+    Ok(crate::api::ok())
+}
+
 /// The whole VM step for the current job → (status line, results). The golden's update session holds all its writes:
 /// on Err the caller discards them, so the golden stays as it was. Blocking.
 fn install(
@@ -1189,143 +1027,77 @@ fn install(
     if info.disk.update_bytes > 0 || info.disk.update_connected {
         return Err("the golden has unsaved maintenance work - Save or Discard it first".into());
     }
-    let target = local_target(
+    // The golden's newest version as the VM's disk: the NBD export named like the update session's iSCSI target.
+    let export = local_target(
         &format!("{}.g{}", diskless::iqn(st, &j.golden), info.disk.ver),
         key,
     );
+    crate::vmmaint::nbd_ready()?;
     let work = work_dir(st)?;
-    let mnt = work.join("mnt");
-    say(
-        st,
-        t,
-        &format!(
-            "attaching {} version g{} to the server",
-            j.golden, info.disk.ver
-        ),
-    );
-    let dev = login(&target)?;
-    // From here every exit logs out (the caller hands the update session back).
-    let r = (|| {
-        let part = windows_part(&dev, &mnt)?;
-        // 1. The script + job into the golden (its startup task runs broom-diskless.ps1).
-        let orig;
-        {
-            let m = Mount::new(&part, &mnt, true)?;
-            let dir = ci_path(&m.dir, "Windows/Setup/Scripts")
-                .filter(|d| d.is_dir())
-                .ok_or("the golden has no C:\\Windows\\Setup\\Scripts — run broom-diskless.ps1 on it first (Diskless page)")?;
-            let ps = ci_path(&dir, "broom-diskless.ps1")
-                .filter(|f| f.is_file())
-                .ok_or("the golden has no broom-diskless.ps1 (its startup task) — run it on the golden first")?;
-            orig = g_read(&ps)?;
-            std::fs::write(work.join("broom-diskless.ps1.orig"), &orig)
-                .map_err(|e| e.to_string())?;
-            for f in ["broom-onboard-result.json", "broom-onboard.log"] {
-                let _ = std::fs::remove_file(dir.join(f));
-            }
-            // The library's drivers for these cards (by vendor + device) next to the script: it adds them to the
-            // golden's driver store before installing the cards.
-            let nets = crate::drivers::net_drivers(st);
-            let ids: Vec<String> = j
-                .nics
-                .iter()
-                .flat_map(|n| n.hwids.iter().chain(n.compat.iter()).cloned())
-                .chain((!j.boot_card.is_empty()).then(|| j.boot_card.clone()))
-                .collect();
-            let drv_dir = g_child(&dir, "broom-drv")?;
-            let _ = std::fs::remove_dir_all(&drv_dir);
-            if std::fs::symlink_metadata(&drv_dir).is_ok() {
-                return Err("an old broom-drv folder in the golden could not be removed".into());
-            }
-            let mut drv = Vec::new();
-            for d in crate::drivers::matching(&nets, &ids) {
-                crate::drivers::unpack(d, &drv_dir.join(&d.name))?;
-                drv.push(format!("broom-drv\\{}", d.name));
-            }
-            if !drv.is_empty() {
-                say(
-                    st,
-                    t,
-                    &format!(
-                        "driver package(s) from the library for these cards: {}",
-                        drv.join(", ").replace("broom-drv\\", "")
-                    ),
-                );
-            }
-            let job_json =
-                serde_json::json!({ "golden": j.golden, "nics": j.nics, "drivers": drv });
-            g_write(
-                &g_child(&dir, "broom-onboard.json")?,
-                job_json.to_string().as_bytes(),
-            )?;
-            g_write(
-                &ps,
-                crate::assets::text("scripts/broom-onboard.ps1").as_bytes(),
-            )?;
+    // The library's drivers for these cards (by vendor + device): the VM gets them over HTTP, and its script adds
+    // them to the golden's driver store before installing the cards.
+    let nets = crate::drivers::net_drivers(st);
+    let ids: Vec<String> = j
+        .nics
+        .iter()
+        .flat_map(|n| n.hwids.iter().chain(n.compat.iter()).cloned())
+        .chain((!j.boot_card.is_empty()).then(|| j.boot_card.clone()))
+        .collect();
+    let drivers: Vec<String> = crate::drivers::matching(&nets, &ids)
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    if !drivers.is_empty() {
+        say(
+            st,
+            t,
+            &format!(
+                "driver package(s) from the library for these cards: {}",
+                drivers.join(", ")
+            ),
+        );
+    }
+    update(st, t, |j| {
+        j.drivers = drivers.clone();
+        j.result = None;
+    });
+    let _ = std::fs::remove_file(work.join("broom-onboard.log"));
+    // Boot it until the script has posted its result (Windows may restart once on new hardware: a try ends there).
+    let mut result = None;
+    for n in 1..=VM_TRIES {
+        say(
+            st,
+            t,
+            &format!(
+                "booting {} version g{} in the onboarding VM (try {n} of {VM_TRIES}, 2-5 min)",
+                j.golden, info.disk.ver
+            ),
+        );
+        run_vm(st, t, &export, &work)?;
+        if let Some(r) = job(st).filter(|x| x.token == *t).and_then(|x| x.result) {
+            result = Some(r);
+            break;
         }
-        // 2. Boot it until the script has written its result.
-        let mut result = None;
-        for n in 1..=VM_TRIES {
-            say(
-                st,
-                t,
-                &format!(
-                    "booting {} in the onboarding VM (try {n} of {VM_TRIES}, 2-5 min)",
-                    j.golden
-                ),
-            );
-            run_vm(st, t, &dev, &work)?;
-            let m = Mount::new(&part, &mnt, false)?;
-            if let Some(f) = ci_path(&m.dir, "Windows/Setup/Scripts/broom-onboard-result.json")
-                .filter(|f| f.is_file())
-            {
-                let txt = String::from_utf8(g_read(&f)?).map_err(|e| e.to_string())?;
-                let log = ci_path(&m.dir, "Windows/Setup/Scripts/broom-onboard.log")
-                    .and_then(|f| g_read(&f).ok())
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                let _ = std::fs::write(work.join("broom-onboard.log"), &log);
-                result = Some(txt);
-                break;
-            }
-            say(
-                st,
-                t,
-                "the VM stopped before the script finished (Windows may restart once on new hardware)",
-            );
-        }
-        let txt = result.ok_or("the script in the VM never finished (see broom-onboard.log / qemu.log in the work folder)")?;
-        let v: serde_json::Value = serde_json::from_str(txt.trim_start_matches('\u{feff}'))
-            .map_err(|e| format!("result unreadable: {e}"))?;
-        // 3. The golden's own script back; the job files out.
-        {
-            let m = Mount::new(&part, &mnt, true)?;
-            let dir = ci_path(&m.dir, "Windows/Setup/Scripts").ok_or("Scripts folder gone")?;
-            let ps = ci_path(&dir, "broom-diskless.ps1").ok_or("broom-diskless.ps1 gone")?;
-            g_write(&ps, &orig)?;
-            if let Ok(d) = g_child(&dir, "broom-drv") {
-                let _ = std::fs::remove_dir_all(d);
-            }
-            for f in [
-                "broom-onboard.json",
-                "broom-onboard-result.json",
-                "broom-onboard.log",
-            ] {
-                let _ = std::fs::remove_file(dir.join(f));
-            }
-        }
-        let results: Vec<serde_json::Value> = v["nics"].as_array().cloned().unwrap_or_default();
-        if v["ok"].as_bool() != Some(true) {
-            return Err(format!(
-                "the VM's script: {}",
-                v["msg"].as_str().unwrap_or("")
-            ));
-        }
-        let msg = judge(&j.nics, &results, &j.mac, &j.boot_card)?;
-        Ok((msg, results))
-    })();
-    logout(&target);
-    r
+        say(
+            st,
+            t,
+            "the VM stopped before the script finished (Windows may restart once on new hardware)",
+        );
+    }
+    let v = result.ok_or(
+        "the script in the VM never finished (see broom-onboard.log / qemu.log in the work folder). A golden set up by \
+         an older Broom runs its own copy of the startup script, not this job's: install the current one in it (the \
+         command on the Diskless page, run in Maintain in the browser), Save, and start again",
+    )?;
+    let results: Vec<serde_json::Value> = v["nics"].as_array().cloned().unwrap_or_default();
+    if v["ok"].as_bool() != Some(true) {
+        return Err(format!(
+            "the VM's script: {}",
+            v["msg"].as_str().unwrap_or("")
+        ));
+    }
+    let msg = judge(&j.nics, &results, &j.mac, &j.boot_card)?;
+    Ok((msg, results))
 }
 
 /// The job's worker thread: install → Save (or Discard), hardware recorded.
@@ -1413,145 +1185,6 @@ fn worker(st: SharedState, token: String) {
             fail(&st, &token, &format!("{e} - {tail}"));
         }
     }
-}
-
-/// A golden step that may meet the daemon still counting a client that just left: tried again for up to ~20 s.
-fn retry_connected<T>(f: &dyn Fn() -> Result<T, String>) -> Result<T, String> {
-    for _ in 0..40 {
-        match f() {
-            Err(e) if e.contains("still connected") => {
-                std::thread::sleep(Duration::from_millis(500))
-            }
-            r => return r,
-        }
-    }
-    f()
-}
-
-// ---------- Update Broom's script in a golden ----------
-
-/// Broom's current broom-diskless.ps1 into golden `name`'s C:\Windows\Setup\Scripts (what its startup task runs), and
-/// no machine's agent folder (C:\ProgramData\Broom) left in it. Ok(true) = something changed. Blocking.
-fn write_script(st: &SharedState, name: &str, ver: u64, key: &str) -> Result<bool, String> {
-    let target = local_target(&format!("{}.g{ver}", diskless::iqn(st, name)), key);
-    let mnt = work_dir(st)?.join("mnt-refresh");
-    let dev = login(&target)?;
-    let r = (|| {
-        let part = windows_part(&dev, &mnt)?;
-        let m = Mount::new(&part, &mnt, true)?;
-        let ps = ci_path(&m.dir, "Windows/Setup/Scripts/broom-diskless.ps1")
-            .filter(|f| f.is_file())
-            .ok_or("the golden has no C:\\Windows\\Setup\\Scripts\\broom-diskless.ps1 (its startup task) — install it on the golden once from its maintenance machine (Diskless page)")?;
-        let new = diskless::script_text(st);
-        let mut changed = false;
-        if g_read(&ps).ok().as_deref() != Some(new.as_bytes()) {
-            g_write(&ps, new.as_bytes())?;
-            changed = true;
-        }
-        if let Some(d) = ci_path(&m.dir, "ProgramData/Broom").filter(|d| d.is_dir()) {
-            std::fs::remove_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
-            changed = true;
-        }
-        Ok(changed)
-    })();
-    logout(&target);
-    r
-}
-
-/// The whole "update script" step for golden `name`: its newest version attached to this server (no VM), the script
-/// written, then saved as the next version (nothing changed: the session discarded). Same conditions as Add hardware:
-/// a Windows golden, no maintenance machine, no unsaved work, no job running. Blocking.
-fn refresh_script(st: &SharedState, name: &str) -> Result<String, String> {
-    for t in ["iscsiadm", "ntfs-3g"] {
-        if which(t).is_none() {
-            return Err(format!("{t} is not installed on this server"));
-        }
-    }
-    if let Some(j) = job(st).filter(active) {
-        return Err(format!(
-            "an Add hardware job is {} for {} — wait for it or cancel it",
-            j.state, j.golden
-        ));
-    }
-    let g = diskless::goldens(st)
-        .into_iter()
-        .find(|g| g.name == name)
-        .ok_or_else(|| format!("no golden {name}"))?;
-    if g.os != "windows" {
-        return Err("the startup script is for Windows goldens".into());
-    }
-    if g.maint.is_some() {
-        return Err(format!(
-            "{name} has a maintenance machine — turn maintenance off (Save or Discard its work) first"
-        ));
-    }
-    let info = diskless::served(name).ok_or("the golden is not served")?;
-    if info.disk.ver == 0 {
-        return Err("the golden has no saved version yet".into());
-    }
-    if info.disk.update_bytes > 0 || info.disk.update_connected {
-        return Err("the golden has unsaved work — Save or Discard it first".into());
-    }
-    {
-        let mut v = VM_GOLDEN.lock();
-        if let Some((o, _)) = v.as_ref() {
-            return Err(format!("{o} is being updated on the server right now"));
-        }
-        *v = Some((name.to_string(), new_write_key()));
-    }
-    let key = vm_key(name).unwrap_or_default();
-    let r = diskless::sync(st).and_then(|()| write_script(st, name, info.disk.ver, &key));
-    *VM_GOLDEN.lock() = None;
-    let _ = diskless::sync(st);
-    let discard = || retry_connected(&|| crate::iscsi::golden_discard(name));
-    match r {
-        Ok(true) => match retry_connected(&|| crate::iscsi::golden_save(name)) {
-            Ok(_) => {
-                let ver = diskless::served(name).map_or(0, |i| i.disk.ver);
-                tracing::info!("golden {name}: Broom's startup script updated → g{ver}");
-                Ok(format!(
-                    "Broom's current startup script is in {name}: saved as version g{ver} (every machine sets itself up again at its next boot)"
-                ))
-            }
-            Err(e) => {
-                let _ = discard();
-                Err(format!(
-                    "written, but Save failed: {e} — the golden is unchanged"
-                ))
-            }
-        },
-        Ok(false) => {
-            let _ = discard();
-            Ok(format!(
-                "{name} already has Broom's current startup script — nothing changed"
-            ))
-        }
-        Err(e) => {
-            let tail = match discard() {
-                Ok(()) => "the golden is unchanged",
-                Err(_) => "its work could not be discarded — Discard it on the Diskless page",
-            };
-            Err(format!("{e} - {tail}"))
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct RefreshBody {
-    name: String,
-}
-
-/// POST /api/diskless/refresh {name} — Broom's current startup script written into a Windows golden as its next
-/// version, without booting it (goldens set up before the script fetched the server's version by itself).
-async fn refresh(
-    State(st): State<SharedState>,
-    Json(b): Json<RefreshBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let msg = tokio::task::spawn_blocking(move || refresh_script(&st, &b.name))
-        .await
-        .map_err(ise)?
-        .map_err(|e| (StatusCode::CONFLICT, e))?;
-    Ok(Json(serde_json::json!({"ok": true, "status": msg})))
 }
 
 fn fail(st: &SharedState, token: &str, msg: &str) {

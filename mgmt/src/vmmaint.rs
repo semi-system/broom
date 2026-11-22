@@ -596,7 +596,7 @@ pub(crate) fn begin(
             s.golden
         ));
     }
-    crate::onboard::preflight_vm()?;
+    crate::onboard::preflight()?;
     // One VM at a time on a server, of either kind.
     if let Some(g) = crate::onboard::running(st) {
         return Err(format!(
@@ -733,7 +733,7 @@ fn stop_qemu(s: &Session) {
 
 /// The daemon listens for NBD (an older daemon, started by a previous build, does not): replaced at once when no
 /// machine is connected to it. Err = what to do. Blocking.
-fn nbd_ready() -> Result<(), String> {
+pub(crate) fn nbd_ready() -> Result<(), String> {
     let up = || Path::new(crate::iscsid::nbd::SOCK).exists();
     if !up() {
         crate::iscsi::upgrade_if_idle();
@@ -900,7 +900,7 @@ async fn status(State(st): State<SharedState>) -> Json<serde_json::Value> {
     let (games_st, problem) = tokio::task::spawn_blocking(|| {
         (
             crate::iscsi::games_status().unwrap_or_default(),
-            crate::onboard::preflight_vm().err(),
+            crate::onboard::preflight().err(),
         )
     })
     .await

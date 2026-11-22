@@ -289,7 +289,6 @@ pub(crate) fn needs(method: &axum::http::Method, path: &str) -> Need {
             "/api/diskless/maint"
             | "/api/diskless/save"
             | "/api/diskless/discard"
-            | "/api/diskless/refresh"
             | "/api/diskless/rebuild"
             | "/api/onboard/start"
             | "/api/onboard/cancel"
@@ -502,6 +501,9 @@ pub(crate) fn is_public(method: &axum::http::Method, path: &str) -> bool {
         "/boot/onboard",
         "/api/onboard/report",
         "/api/onboard/state",
+        "/api/onboard/job",
+        "/api/onboard/drivers",
+        "/api/onboard/result",
         "/api/tls/port",
     ];
     // /boot/iso/, /boot/nocloud/: a golden's Ubuntu installer, answered to its maintenance machine only (diskless.rs).

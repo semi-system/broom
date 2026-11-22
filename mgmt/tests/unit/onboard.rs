@@ -1,8 +1,9 @@
 use super::{
-    Job, Nic, WINPE_FILES, active, busid_card, judge, parse_pnputil, parse_report, parse_wmic,
-    qemu_args, secure_boot, startnet, waiting_hint, wimboot_script,
+    Job, Nic, WINPE_FILES, active, busid_card, client_answer, judge, parse_pnputil, parse_report,
+    parse_wmic, put, qemu_args, secure_boot, startnet, vm_asking, vm_job, vm_script, waiting_hint,
+    wimboot_script,
 };
-use super::{ci_path, g_child, g_read, g_write};
+use std::collections::HashMap;
 
 /// pnputil /enum-devices /class Net /ids as Windows PE 26100 prints it (English), with a miniport and two cards.
 const PNPUTIL: &str = "Microsoft PnP Utility\r\n\r\n\
@@ -142,18 +143,27 @@ fn startnet_runs_the_reporter() {
     );
 }
 
+/// The job's VM: the golden is an NBD export of the daemon on its root-only socket (AHCI: Windows has storahci at
+/// boot), no block device of the server, QEMU's NAT with an e1000e for the script's way to the server, no screen, and
+/// it exits at the first restart (a try ends there).
 #[test]
-fn qemu_disk_is_ahci_without_network() {
-    let a = qemu_args("/dev/disk/by-path/x", "/c.fd", "/v.fd", "/q.sock");
+fn qemu_disk_is_ahci_over_nbd() {
+    let a = qemu_args(
+        "iqn.x:golden-w.g2.u0123456789abcdef",
+        "/c.fd",
+        "/v.fd",
+        "/q.sock",
+    );
     let j = a.join(" ");
     assert!(j.contains("-machine q35,accel=kvm -cpu host"));
-    assert!(j.contains("file=/dev/disk/by-path/x,format=raw,if=none,id=d0,cache=none"));
+    assert!(j.contains(
+        "-blockdev driver=nbd,node-name=d0,server.type=unix,server.path=/run/broom-nbd.sock,export=iqn.x:golden-w.g2.u0123456789abcdef"
+    ));
+    assert!(!j.contains("/dev/"), "no block device of the server: {j}");
     assert!(j.contains("-device ahci,id=sata -device ide-hd,drive=d0,bus=sata.0,bootindex=1"));
-    assert!(
-        j.contains("-nic none"),
-        "the golden must not reach the LAN from the VM"
-    );
+    assert!(j.contains("-netdev user,id=n0 -device e1000e,netdev=n0"));
     assert!(j.contains("if=pflash,format=raw,readonly=on,file=/c.fd"));
+    assert!(j.contains("-display none"));
     assert!(j.ends_with("-no-reboot"));
 }
 
@@ -361,91 +371,6 @@ fn judge_finds_the_boot_card_by_ipxe() {
     );
 }
 
-/// Nothing in a mounted golden is reached through a symbolic link: a link as a folder on the way, as the file
-/// itself, or at the name of a file this server is about to write, is refused — the server's own files outside the
-/// mount stay untouched (it works there as root).
-#[test]
-fn golden_paths_never_follow_links() {
-    use std::os::unix::fs::symlink;
-    let d = std::env::temp_dir().join(format!("broom-golden-links-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    let (root, out) = (d.join("mnt"), d.join("outside"));
-    std::fs::create_dir_all(root.join("Windows/Setup/Scripts")).unwrap();
-    std::fs::create_dir_all(root.join("WINDOWS2/setup")).unwrap();
-    std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(out.join("secret"), b"server file").unwrap();
-    std::fs::write(root.join("Windows/Setup/Scripts/broom-diskless.ps1"), b"ps").unwrap();
-
-    // Plain paths, any case.
-    let dir = ci_path(&root, "windows/SETUP/scripts").expect("found without case");
-    assert_eq!(dir, root.join("Windows/Setup/Scripts"));
-    let ps = ci_path(&dir, "Broom-Diskless.ps1").unwrap();
-    assert_eq!(g_read(&ps).unwrap(), b"ps");
-    g_write(&ps, b"new").unwrap();
-    assert_eq!(std::fs::read(&ps).unwrap(), b"new");
-    assert!(ci_path(&root, "Windows/Nope").is_none());
-
-    // A folder on the way that is a link out of the mount.
-    symlink("../../../outside", root.join("WINDOWS2/setup/Scripts")).unwrap();
-    assert!(ci_path(&root, "WINDOWS2/setup/Scripts").is_none());
-    assert!(ci_path(&root, "WINDOWS2/setup/Scripts/secret").is_none());
-    symlink(&out, root.join("ProgramData")).unwrap();
-    assert!(ci_path(&root, "ProgramData/secret").is_none());
-
-    // The file itself a link (also a dangling one, which a write would otherwise create at its target).
-    symlink(out.join("secret"), dir.join("broom-onboard-result.json")).unwrap();
-    assert!(ci_path(&dir, "broom-onboard-result.json").is_none());
-    assert!(g_read(&dir.join("broom-onboard-result.json")).is_err());
-    symlink(out.join("made-by-server"), dir.join("broom-onboard.json")).unwrap();
-    assert!(g_child(&dir, "broom-onboard.json").is_err());
-    assert!(g_write(&dir.join("broom-onboard.json"), b"{}").is_err());
-    symlink(&out, dir.join("broom-drv")).unwrap();
-    assert!(g_child(&dir, "broom-drv").is_err());
-    assert_eq!(
-        g_child(&dir, "new-file").unwrap(),
-        dir.join("new-file"),
-        "a name not there yet is fine"
-    );
-
-    // Outside: as it was.
-    assert_eq!(std::fs::read(out.join("secret")).unwrap(), b"server file");
-    assert!(!out.join("made-by-server").exists());
-    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
-    let _ = std::fs::remove_dir_all(&d);
-}
-
-/// Live: the same on a real NTFS volume mounted as the server mounts a golden (ntfs-3g, root, /dev/fuse).
-/// BROOM_NTFS_IMG = an NTFS image file prepared with a link `Windows/Setup/Scripts -> ../../../outside` and a plain
-/// folder `Plain`; BROOM_NTFS_MNT = an empty folder two levels below the one holding `outside`.
-#[test]
-#[ignore]
-fn live_ntfs_mount_refuses_links() {
-    let (Ok(img), Ok(mnt)) = (
-        std::env::var("BROOM_NTFS_IMG"),
-        std::env::var("BROOM_NTFS_MNT"),
-    ) else {
-        return;
-    };
-    let mnt = std::path::PathBuf::from(mnt);
-    let m = super::Mount::new(std::path::Path::new(&img), &mnt, true).expect("mount");
-    assert!(ci_path(&m.dir, "Windows/Setup").is_some());
-    assert!(
-        ci_path(&m.dir, "Windows/Setup/Scripts").is_none(),
-        "the link is not followed"
-    );
-    let plain = ci_path(&m.dir, "plain").expect("plain folder, any case");
-    g_write(&g_child(&plain, "f.txt").unwrap(), b"ok").unwrap();
-    assert_eq!(g_read(&plain.join("f.txt")).unwrap(), b"ok");
-    let opts = std::fs::read_to_string("/proc/mounts").unwrap();
-    let line = opts
-        .lines()
-        .find(|l| l.split(' ').nth(1) == mnt.to_str())
-        .expect("mounted");
-    for o in ["nosuid", "nodev", "noexec"] {
-        assert!(line.contains(o), "{o} missing: {line}");
-    }
-}
-
 /// A Windows PE report counts only with the job's token AND from the job's machine (its MAC behind the sender): the
 /// token crosses the LAN in plain-HTTP URLs.
 #[test]
@@ -619,33 +544,6 @@ fn reporter_is_built_not_committed() {
     }
 }
 
-/// A golden's disk the server's multipath service sits on is refused with the way out (its partitions are not on the
-/// disk itself then, and writing past multipath is not safe); a plain disk is used as it is.
-#[test]
-fn disk_under_multipath_is_refused() {
-    let d = std::env::temp_dir().join(format!("broom-taken-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    let sys = d.join("sys");
-    std::fs::create_dir_all(sys.join("sdb/holders/dm-0")).unwrap();
-    std::fs::create_dir_all(sys.join("sdc/holders")).unwrap();
-    std::fs::create_dir_all(d.join("dev")).unwrap();
-    for n in ["sdb", "sdc"] {
-        std::fs::write(d.join("dev").join(n), b"").unwrap();
-    }
-    let why = super::taken(&sys, &d.join("dev/sdb")).expect("sdb is under dm-0");
-    assert!(
-        why.contains("sdb is under dm-0")
-            && why.contains("vendor \"BROOM\"")
-            && why.contains("multipath -w"),
-        "{why}"
-    );
-    assert_eq!(super::taken(&sys, &d.join("dev/sdc")), None);
-    // Not known to /sys at all (no such block device): nothing held against it.
-    std::fs::write(d.join("dev/sdz"), b"").unwrap();
-    assert_eq!(super::taken(&sys, &d.join("dev/sdz")), None);
-    let _ = std::fs::remove_dir_all(&d);
-}
-
 /// The boot files kept in the repository as binaries (they are signed, so they cannot be rebuilt here) are exactly
 /// the pinned releases: wimboot = the SHA-256 in ipxe/fetch-signed.sh, the signed iPXE and its shim = the ones
 /// fetch-signed.sh wrote into ipxe/signed/VERSION. A changed file fails here, not on a PC.
@@ -689,39 +587,136 @@ fn qemu_paths_keep_their_commas() {
     );
 }
 
-/// What a failed login says never carries the job's write key; a name without a key is left as it is.
+/// A server state over an in-memory database (what the job's endpoints read).
+fn state() -> crate::SharedState {
+    std::sync::Arc::new(crate::AppState {
+        db: crate::db::open(":memory:").unwrap(),
+        jobs: Default::default(),
+        job_tx: tokio::sync::broadcast::channel(8).0,
+        versions_lock: Default::default(),
+        net: Default::default(),
+        pxe_seen: Default::default(),
+        pxe_ip: Default::default(),
+        not_reset: Default::default(),
+        ssd_low: Default::default(),
+    })
+}
+
+fn running_job() -> Job {
+    Job {
+        golden: "w11".into(),
+        token: "0123456789abcdef0123456789abcdef".into(),
+        state: "installing".into(),
+        nics: vec![nic("PCI\\VEN_8086&DEV_10D3\\1", "aa:bb:cc:dd:ee:01")],
+        drivers: vec!["intel-e1000e".into()],
+        ..Job::default()
+    }
+}
+
+/// Who the job's VM is: the connection comes from this server itself (QEMU's NAT: loopback or one of its addresses),
+/// and only while the job is installing — a PC on the LAN, a waiting or finished job and no job at all get nothing.
 #[test]
-fn a_failed_login_does_not_show_the_write_key() {
-    let key = "0123456789abcdef0123456789abcdef";
-    let t = super::local_target("iqn.2026-01.local.broom-1:golden-w11.g7", key);
-    let e = format!("iscsiadm -m node -T {t} -p 127.0.0.1 --login: Could not log into {t}");
-    let shown = super::hide_key(&e, &t);
+fn only_this_server_is_the_vm() {
+    use std::net::IpAddr;
+    let st = state();
+    let lo: IpAddr = "127.0.0.1".parse().unwrap();
+    let lan: IpAddr = "203.0.113.9".parse().unwrap();
+    assert!(vm_job(&st, lo).is_none(), "no job");
+    let mut j = running_job();
+    put(&st, &j);
+    assert!(vm_job(&st, lo).is_some());
     assert!(
-        !shown.contains(key) && shown.contains("golden-w11.g7.u(key)"),
-        "{shown}"
+        vm_job(&st, lan).is_none(),
+        "a host on the LAN is not the VM"
     );
-    let plain = "iqn.2026-01.local.broom-1:golden-ubuntu.g1";
+    assert!(client_answer(&st, lan).is_none() && vm_script(&st, lan).is_none());
+    for state in ["waiting", "done", "failed", "cancelled"] {
+        j.state = state.into();
+        put(&st, &j);
+        assert!(vm_job(&st, lo).is_none(), "{state}");
+    }
+}
+
+/// The VM is told it is a maintenance machine (no base, no agent) and gets the job's script with this server's address
+/// and the job's token in it — and the token is nowhere else.
+#[test]
+fn the_vm_gets_the_onboarding_script() {
+    let st = state();
+    st.db.set_config("dhcp_server_ip", "192.168.50.2").unwrap();
+    put(&st, &running_job());
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let v = client_answer(&st, lo).unwrap();
+    assert_eq!(v["role"], "maintenance");
+    assert_eq!(v["golden"], "w11");
+    let text = vm_script(&st, lo).unwrap();
+    assert!(
+        text.contains("$srv = '192.168.50.2'"),
+        "the server's address"
+    );
+    assert!(
+        text.contains("$tok = '0123456789abcdef0123456789abcdef'"),
+        "the job's token"
+    );
+    assert!(!text.contains("__SERVER__") && !text.contains("__TOKEN__"));
+    assert!(text.is_ascii(), "Windows scripts are ASCII only");
+    // The same file as the repository's, with nothing but those two values filled in.
+    let raw = crate::assets::text("scripts/broom-onboard.ps1");
     assert_eq!(
-        super::hide_key("x golden-ubuntu.g1 y", plain),
-        "x golden-ubuntu.g1 y"
+        text,
+        raw.replace("__SERVER__", "192.168.50.2")
+            .replace("__TOKEN__", "0123456789abcdef0123456789abcdef")
     );
 }
 
-/// A file inside a golden is read whole only up to a size: a huge one is refused, not loaded.
+/// A request of the VM needs the job's token as well as this server's address: no token, an empty one and a wrong one
+/// are refused, a running job's own is not.
 #[test]
-fn a_goldens_file_is_read_up_to_a_size() {
-    let d = std::env::temp_dir().join(format!("broom-gread-{}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    let small = d.join("small.inf");
-    std::fs::write(&small, b"[Version]").unwrap();
-    assert_eq!(super::g_read(&small).unwrap(), b"[Version]");
-    // Sparse: as large as it claims, nothing on disk.
-    let big = d.join("big.bin");
-    std::fs::File::create(&big)
-        .unwrap()
-        .set_len((64 << 20) + 1)
-        .unwrap();
-    let e = super::g_read(&big).unwrap_err();
-    assert!(e.contains("larger than 64 MB"), "{e}");
-    std::fs::remove_dir_all(&d).unwrap();
+fn the_vm_needs_the_token() {
+    let st = state();
+    put(&st, &running_job());
+    let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let q = |t: Option<&str>| -> HashMap<String, String> {
+        t.map(|t| ("t".to_string(), t.to_string()))
+            .into_iter()
+            .collect()
+    };
+    assert!(vm_asking(&st, &q(None), lo).is_err());
+    assert!(vm_asking(&st, &q(Some("")), lo).is_err());
+    assert!(vm_asking(&st, &q(Some("0123456789abcdef0123456789abcdeg")), lo).is_err());
+    let lan: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    assert!(
+        vm_asking(&st, &q(Some("0123456789abcdef0123456789abcdef")), lan).is_err(),
+        "the right token from another host"
+    );
+    let j = vm_asking(&st, &q(Some("0123456789abcdef0123456789abcdef")), lo).unwrap();
+    assert_eq!(j.golden, "w11");
+}
+
+/// The three endpoints the VM calls are open to the network layer's login (the VM has no account) — and guarded by the
+/// token and the address above; everything else of Add hardware still needs a session.
+#[test]
+fn the_vm_endpoints_are_public_the_rest_is_not() {
+    use axum::http::Method;
+    for p in [
+        "/api/onboard/job",
+        "/api/onboard/drivers",
+        "/api/onboard/result",
+    ] {
+        assert!(
+            crate::auth::is_public(&Method::GET, p) && crate::auth::is_public(&Method::POST, p),
+            "{p}"
+        );
+    }
+    for p in [
+        "/api/onboard",
+        "/api/onboard/start",
+        "/api/onboard/cancel",
+        "/api/onboard/retry",
+    ] {
+        assert!(!crate::auth::is_public(&Method::POST, p), "{p}");
+    }
+    assert!(!crate::auth::is_public(
+        &Method::POST,
+        "/api/diskless/refresh"
+    ));
 }

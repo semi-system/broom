@@ -193,9 +193,16 @@ pub(crate) fn winpe_bundle(st: &SharedState) -> Result<Option<std::sync::Arc<Vec
     Ok(Some(b))
 }
 
-/// Package `d`'s files under `dest` (Add hardware: into the golden). Blocking.
-pub(crate) fn unpack(d: &Driver, dest: &std::path::Path) -> Result<(), String> {
-    crate::archive::untar_gz(&tar_path(&d.name), dest)
+/// The packages `names` as one tar, a folder each (Add hardware: what the job's VM downloads and unpacks with
+/// Windows' tar.exe). A package that is gone is an error. Blocking.
+pub(crate) fn bundle_of(names: &[String]) -> Result<Vec<u8>, String> {
+    let mut files = Vec::new();
+    for name in names {
+        for (p, b) in crate::archive::tar_gz_files(&tar_path(name))? {
+            files.push((format!("{name}/{p}"), b));
+        }
+    }
+    crate::archive::tar(&files)
 }
 
 /// Packages one machine gets: a hardware ID matches, the package targets its group, or "all machines".
