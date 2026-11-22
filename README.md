@@ -67,6 +67,17 @@ their own layer over it. Every boot resets to `base ← drivers ← fresh child`
 ## Requirements
 
 - **Server:** x86_64 Linux (tested on Debian/Ubuntu and Rocky Linux 10), run as root, disk space for the goldens.
+  **No packages to install** for the boot server itself (DHCP, TFTP, iSCSI, DNS, the web admin, image conversion, NTFS
+  reading are all in the binary; no kernel modules). Only two optional parts use programs of the system:
+  - **The VM features** (*Maintain in the browser* and *Add hardware* on the Diskless page): QEMU, OVMF and `/dev/kvm`.
+    The Diskless page shows what is missing and an owner installs it with **Install** (it detects apt, dnf or yum and
+    runs the command as root). The VM's disk comes from Broom's own daemon over a Unix socket and *Add hardware*'s job
+    over HTTP, so no `open-iscsi` and no `ntfs-3g`.
+  - **Formatting a server disk** (*Server → Disks*): `mkfs.xfs` (package `xfsprogs`) for XFS with reflink; without it
+    the disk is formatted ext4, where versions do not share their data.
+
+  `install-service` needs systemd. Where systemd is there, the iSCSI daemon and the VM run as its transient units;
+  without it they start as plain processes and the binary runs in the foreground.
 - **Clients:** x86_64 PCs, UEFI or legacy BIOS (CSM), **PXE first in the boot order**. Windows images need a local
   SSD; Linux images can run without one (writes in RAM). [Diskless goldens](#diskless-machines-no-ssd) run Windows (or
   Linux) with no disk at all, entirely from the server (tested on UEFI clients only).
