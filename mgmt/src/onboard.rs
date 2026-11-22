@@ -21,7 +21,7 @@
 //     progress.
 //  3. Broom boots the golden's newest version in a small VM on this server (QEMU/KVM, AHCI disk): the disk is an NBD
 //     export of Broom's own iSCSI daemon with the job's write key, so everything the guest writes is the golden's
-//     "update session" (the loopback address alone does not get to write it), and QEMU's NAT gives the guest the server.
+//     "update session" (the loopback address alone does not get to write it), and its network is QEMU's restricted one: nothing but the server's HTTP port, forwarded at the server's own address.
 //     The golden's own startup task asks the server who it is and fetches the server's current script; to this VM
 //     the server answers with broom-onboard.ps1 and the job's token (see "the VM's side of the job" below). The script
 //     gets the job and the library's drivers over HTTP, creates each card's device with that exact instance ID, lets
@@ -699,7 +699,8 @@ pub(crate) fn preflight() -> Result<(), String> {
 //   then on it cannot open the server's files, other disks, or signal other processes;
 // - QEMU's seccomp filter (-sandbox): no obsolete system calls, no new processes, no scheduling / resource changes.
 // The maintenance VM's own unit adds systemd's file-system and capability limits (vmmaint::launch).
-// Its network is NOT narrowed: it reaches the internet and the LANs the server reaches, through QEMU's NAT.
+// The maintenance VM's network is NOT narrowed: it reaches the internet and the LANs the server reaches, through QEMU's
+// NAT. Add hardware's VM is: `restricted_netdev`.
 
 /// The user QEMU runs as once started: nobody (uid:gid, the same number on Debian, Ubuntu, Fedora…).
 pub(crate) const QEMU_USER: &str = "65534:65534";
@@ -792,11 +793,42 @@ pub(crate) fn ovmf() -> Option<(PathBuf, PathBuf)> {
     .find(|(c, v)| c.is_file() && v.is_file())
 }
 
+/// The VM's network: QEMU's user-mode network made to look like the server's own subnet, with `restrict=on` (nothing
+/// of the host or the internet is reachable) and ONE forward: the server's address, port 80 (where the golden's startup
+/// script looks for it: `http://<server>/…`) goes to the server's own HTTP port on its loopback. The guest gets an
+/// address from QEMU's DHCP; its gateway, DNS and DHCP pool sit at addresses chosen to leave the server's free (the
+/// forwarded address must not be one of QEMU's own). The value of `-netdev`. Err = the address cannot carry it.
+pub(crate) fn restricted_netdev(server_ip: &str, port: u16) -> Result<String, String> {
+    let ip: std::net::Ipv4Addr = server_ip.parse().map_err(|_| {
+        format!("the server's address {server_ip:?} is not an IPv4 address: the VM's restricted network cannot be built on it")
+    })?;
+    let [a, b, c, last] = ip.octets();
+    if last == 0 || last == 255 {
+        return Err(format!(
+            "{ip} is a network or broadcast address: the VM's restricted network cannot be built on it"
+        ));
+    }
+    let spare: Vec<u8> = [254u8, 253, 252, 251]
+        .into_iter()
+        .filter(|x| *x != last)
+        .collect();
+    let (host, dns) = (spare[0], spare[1]);
+    // QEMU's DHCP pool is 16 addresses from `dhcpstart`.
+    let start = [100u8, 130, 160]
+        .into_iter()
+        .find(|s| !(*s..*s + 16).contains(&last))
+        .unwrap_or(100);
+    Ok(format!(
+        "user,id=n0,net={a}.{b}.{c}.0/24,host={a}.{b}.{c}.{host},dns={a}.{b}.{c}.{dns},dhcpstart={a}.{b}.{c}.{start},restrict=on,guestfwd=tcp:{ip}:80-tcp:127.0.0.1:{port}"
+    ))
+}
+
 /// QEMU's arguments: the golden as an AHCI disk (Windows has storahci at boot) — the daemon's NBD export `disk` on its
-/// root-only socket, like the maintenance VM's (vmmaint.rs) — QEMU's own NAT with an e1000e (Windows has its driver):
-/// the golden's startup script fetches Broom's script for this job from the server through it, and nothing else is
-/// given (no screen: a QMP socket for a screenshot when debugging), off = exit.
-pub(crate) fn qemu_args(disk: &str, code: &str, vars: &str, qmp: &str) -> Vec<String> {
+/// root-only socket, like the maintenance VM's (vmmaint.rs) — and the restricted network `net` (`restricted_netdev`)
+/// with an e1000e (Windows has its driver): the golden's startup script fetches Broom's script for this job from the
+/// server through it, and nothing else is reachable (no screen: a QMP socket for a screenshot when debugging), off =
+/// exit.
+pub(crate) fn qemu_args(disk: &str, code: &str, vars: &str, qmp: &str, net: &str) -> Vec<String> {
     [
         "-name",
         "broom-onboard",
@@ -819,7 +851,7 @@ pub(crate) fn qemu_args(disk: &str, code: &str, vars: &str, qmp: &str) -> Vec<St
         "-device",
         "ide-hd,drive=d0,bus=sata.0,bootindex=1",
         "-netdev",
-        "user,id=n0",
+        net,
         "-device",
         "e1000e,netdev=n0",
         "-display",
@@ -850,11 +882,16 @@ fn run_vm(st: &SharedState, token: &str, export: &str, work: &FsPath) -> Result<
     std::fs::copy(&vars_t, &vars).map_err(|e| format!("OVMF vars: {e}"))?;
     let qmp = work.join("qmp.sock");
     let _ = std::fs::remove_file(&qmp);
+    let net = restricted_netdev(
+        &st.db.get_config("dhcp_server_ip", ""),
+        crate::HTTP_PORT.load(std::sync::atomic::Ordering::Relaxed),
+    )?;
     let mut args = qemu_args(
         export,
         &code.to_string_lossy(),
         &vars.to_string_lossy(),
         &qmp.to_string_lossy(),
+        &net,
     );
     args.extend(confine_args(qemu_version()));
     let log = std::fs::File::create(work.join("qemu.log")).map_err(|e| e.to_string())?;
@@ -906,7 +943,7 @@ fn run_vm(st: &SharedState, token: &str, export: &str, work: &FsPath) -> Result<
 // job's token in it. That script gets the job and the library's drivers over HTTP, installs the cards and posts its
 // result. So nothing is written into the golden's disk by the server — no mount, no ntfs-3g, no iscsiadm: the disk
 // reaches QEMU over NBD (vmmaint::nbd_blockdev) and the guest's own writes are the update session Save keeps.
-// Who may ask: the connection comes from this server itself (the VM reaches it through QEMU's NAT, like the
+// Who may ask: the connection comes from this server itself (the VM reaches it through the forward of its restricted network, which QEMU opens from this server's loopback, like the
 // maintenance VM) and carries the job's token; the token is only ever in the script served to that connection.
 
 /// The running job, when `peer` is this server (the job's VM: nothing else on this server runs a job's script).

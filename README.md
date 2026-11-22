@@ -294,7 +294,8 @@ PC down.
   Microsoft-signed, so it also works with *Secure Boot clients*), which reports its cards to Broom (the report
   counts only with the job's token and from that PC's network card). Broom boots the golden's newest version in a
   small VM (QEMU/KVM, confined as the maintenance VM; its disk is an NBD export of Broom's own daemon, written with
-  that job's own key, and it reaches the server through QEMU's NAT). The golden's own startup task asks the server for
+  that job's own key; its network is closed — QEMU's `restrict=on` with one forward, the server's address on port 80 to
+  Broom's own HTTP port — so it reaches nothing but Broom: no internet, no LAN). The golden's own startup task asks the server for
   its script, and to this VM the server answers with `broom-onboard.ps1`, which gets the job and the library's drivers
   over HTTP, creates each card's device with that instance ID and lets Windows install the best driver from its
   driver store, marked as a network-boot driver; then Broom saves the golden's next version and the PC restarts into

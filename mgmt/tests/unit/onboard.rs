@@ -144,8 +144,8 @@ fn startnet_runs_the_reporter() {
 }
 
 /// The job's VM: the golden is an NBD export of the daemon on its root-only socket (AHCI: Windows has storahci at
-/// boot), no block device of the server, QEMU's NAT with an e1000e for the script's way to the server, no screen, and
-/// it exits at the first restart (a try ends there).
+/// boot), no block device of the server, the restricted network with an e1000e for the script's way to the server, no
+/// screen, and it exits at the first restart (a try ends there).
 #[test]
 fn qemu_disk_is_ahci_over_nbd() {
     let a = qemu_args(
@@ -153,6 +153,7 @@ fn qemu_disk_is_ahci_over_nbd() {
         "/c.fd",
         "/v.fd",
         "/q.sock",
+        "user,id=n0,restrict=on",
     );
     let j = a.join(" ");
     assert!(j.contains("-machine q35,accel=kvm -cpu host"));
@@ -161,7 +162,7 @@ fn qemu_disk_is_ahci_over_nbd() {
     ));
     assert!(!j.contains("/dev/"), "no block device of the server: {j}");
     assert!(j.contains("-device ahci,id=sata -device ide-hd,drive=d0,bus=sata.0,bootindex=1"));
-    assert!(j.contains("-netdev user,id=n0 -device e1000e,netdev=n0"));
+    assert!(j.contains("-netdev user,id=n0,restrict=on -device e1000e,netdev=n0"));
     assert!(j.contains("if=pflash,format=raw,readonly=on,file=/c.fd"));
     assert!(j.contains("-display none"));
     assert!(j.ends_with("-no-reboot"));
@@ -719,4 +720,49 @@ fn the_vm_endpoints_are_public_the_rest_is_not() {
         &Method::POST,
         "/api/diskless/refresh"
     ));
+}
+
+/// The VM's network is QEMU's user-mode one made to look like the server's own subnet, closed (`restrict=on`) but for
+/// one forward: the server's address on port 80 goes to the server's own HTTP port on its loopback. (Checked live with
+/// a Linux guest under QEMU 10.2: the forwarded address answers, the gateway, the internet and another port of the
+/// server's address do not.)
+#[test]
+fn the_vm_network_is_closed_but_for_the_server() {
+    use super::restricted_netdev;
+    let n = restricted_netdev("192.168.50.2", 8080).unwrap();
+    assert_eq!(
+        n,
+        "user,id=n0,net=192.168.50.0/24,host=192.168.50.254,dns=192.168.50.253,dhcpstart=192.168.50.100,\
+         restrict=on,guestfwd=tcp:192.168.50.2:80-tcp:127.0.0.1:8080"
+    );
+    // The forwarded address is never one of QEMU's own (gateway, DNS) nor in its DHCP pool of 16.
+    for last in 1..=254u8 {
+        let n = restricted_netdev(&format!("10.1.2.{last}"), 80).unwrap();
+        let get = |k: &str| -> u8 {
+            n.split(',')
+                .find_map(|p| p.strip_prefix(k))
+                .and_then(|v| v.rsplit('.').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let (host, dns, start) = (get("host="), get("dns="), get("dhcpstart="));
+        assert!(last != host && last != dns, "{last}: {n}");
+        assert!(!(start..start + 16).contains(&last), "{last}: {n}");
+        assert!(
+            host != dns
+                && !(start..start + 16).contains(&host)
+                && !(start..start + 16).contains(&dns),
+            "{n}"
+        );
+        assert!(n.contains("restrict=on"));
+        assert!(n.contains(&format!("guestfwd=tcp:10.1.2.{last}:80-tcp:127.0.0.1:80")));
+    }
+    // Addresses it cannot be built on.
+    assert!(restricted_netdev("", 80).is_err());
+    assert!(restricted_netdev("fe80::1", 80).is_err());
+    assert!(restricted_netdev("192.168.50.0", 80).is_err());
+    assert!(restricted_netdev("192.168.50.255", 80).is_err());
+    // Nothing else is ever forwarded or left open.
+    assert_eq!(n.matches("guestfwd=").count(), 1);
+    assert!(!n.contains("hostfwd") && !n.contains("restrict=off"));
 }
